@@ -65,7 +65,7 @@ const logoUploadUrlSchema = z.object({
     }),
   }),
 });
-
+ 
 function assertValidId(id, res) {
   if (!UUID_REGEX.test(id)) {
     res.status(400).json({ error: "ID буруу байна." });
