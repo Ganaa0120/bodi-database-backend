@@ -2,16 +2,17 @@
 
 const jwt = require('jsonwebtoken');
 const { verifyAccessToken } = require('../utils/jwt');
+const { runRequestInContext } = require('../config/db');
 
 /**
- * Authorization: Bearer <token> header-ээс access token-ийг унших,
- * шалгаад req.auth = { userId, role, companyId, departmentId } гэж
- * тавина.
+ * Authorization: Bearer <token> header-ээс access token-ийг уншиж,
+ * шалгаад req.auth = { userId, role, companyId, departmentId } гэж тавина.
  *
- * ЧУХАЛ: req.auth.companyId/departmentId нь ЗӨВХӨН энэ token-с
- * гардаг — client-с request body/query-ээр ирсэн company_id-г
- * ХЭЗЭЭ Ч итгэж ашиглахгүй. Дараагийн шатанд (RLS холбох middleware)
- * яг энэ req.auth-ийг ашиглан DB session variable тохируулна.
+ * Мөн энэ хүсэлтийн бүх DB query-г тухайн хэрэглэгчийн RLS context-тэй
+ * ажиллуулна (config/db.js → runRequestInContext).
+ *
+ * ЧУХАЛ: companyId/departmentId нь ЗӨВХӨН token-оос гарна — client-ээс
+ * body/query-ээр ирсэн company_id-д ХЭЗЭЭ Ч итгэхгүй.
  */
 function authenticate(req, res, next) {
   const header = req.headers.authorization || '';
@@ -21,26 +22,29 @@ function authenticate(req, res, next) {
     return res.status(401).json({ error: 'Нэвтрэх шаардлагатай.' });
   }
 
+  let payload;
   try {
-    const payload = verifyAccessToken(token);
-    req.auth = {
-      userId: payload.sub,
-      role: payload.role,
-      companyId: payload.companyId,
-      departmentId: payload.departmentId,
-    };
-    return next();
+    payload = verifyAccessToken(token);
   } catch (err) {
     if (err instanceof jwt.TokenExpiredError) {
       return res.status(401).json({ error: 'Token хугацаа дууссан.', code: 'TOKEN_EXPIRED' });
     }
     return res.status(401).json({ error: 'Token хүчингүй байна.' });
   }
+
+  req.auth = {
+    userId: payload.sub,
+    role: payload.role,
+    companyId: payload.companyId || null,
+    departmentId: payload.departmentId || null,
+  };
+
+  return runRequestInContext(req, res, next, req.auth);
 }
 
 /**
- * Тодорхой role(ууд)-д л зөвшөөрөгдсөн route хийхэд ашиглана.
- * Жишээ: router.get('/admin/x', authenticate, authorize('super_admin'), handler)
+ * Тодорхой role(ууд)-д л зөвшөөрөгдсөн route.
+ * Жишээ: router.get('/x', authenticate, authorize('super_admin'), handler)
  */
 function authorize(...allowedRoles) {
   return (req, res, next) => {

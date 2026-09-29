@@ -3,18 +3,31 @@
 const { hashPassword } = require('./authService');
 
 /**
- * Компани/хэлтэсийн админ хэрэглэгч (login) үүсгэх нийтлэг логик.
- * "executor" нь эсвэл config/db.js-ийн `pool`, эсвэл transaction доторх
- * `client` байж болно — хоёул ижил .query(text, params) интерфэйстэй тул
- * энэ функц хэзээ transaction дотор, хэзээ дангаараа дуудагдахаас
- * үл хамааран ажиллана.
+ * Имэйл системд (аль ч компанид) бүртгэлтэй эсэх.
+ *
+ * RLS-ийн улмаас CEO зөвхөн өөрийн компанийн хэрэглэгчдийг хардаг тул
+ * энгийн SELECT-ээр өөр компанид бүртгэлтэй имэйлийг илрүүлж чадахгүй.
+ * app.email_in_use() нь SECURITY DEFINER функц — зөвхөн true/false
+ * буцаадаг тул өөр компанийн мэдээлэл задрахгүй.
  */
-async function createLinkedUser(executor, { email, password, fullName, role, companyId, departmentId = null }) {
-  const existing = await executor.query(
-    `SELECT id FROM users WHERE lower(email) = lower($1) AND deleted_at IS NULL`,
-    [email]
-  );
-  if (existing.rows.length > 0) {
+async function isEmailInUse(executor, email, excludeUserId = null) {
+  const result = await executor.query('SELECT app.email_in_use($1, $2) AS in_use', [
+    email,
+    excludeUserId,
+  ]);
+  return result.rows[0].in_use === true;
+}
+
+/**
+ * Компани/хэлтсийн админ хэрэглэгч (login) үүсгэх нийтлэг логик.
+ * "executor" нь config/db.js-ийн query-тэй адил .query(text, params)
+ * интерфейстэй аль ч объект (жишээ нь withTransaction доторх client).
+ */
+async function createLinkedUser(
+  executor,
+  { email, password, fullName, role, companyId, departmentId = null }
+) {
+  if (await isEmailInUse(executor, email)) {
     const err = new Error('Энэ имэйл хаяг өөр хэрэглэгчид бүртгэлтэй байна.');
     err.statusCode = 409;
     throw err;
@@ -32,4 +45,4 @@ async function createLinkedUser(executor, { email, password, fullName, role, com
   return result.rows[0];
 }
 
-module.exports = { createLinkedUser };
+module.exports = { createLinkedUser, isEmailInUse };

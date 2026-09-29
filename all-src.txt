@@ -1,0 +1,3759 @@
+﻿
+===== src\config\db.js =====
+
+'use strict';
+
+const { Pool } = require('pg');
+const env = require('./env');
+
+// Azure Database for PostgreSQL Flexible Server Ð½ÑŒ TLS ÑˆÐ°Ð°Ñ€Ð´Ð»Ð°Ð³Ð°Ñ‚Ð°Ð¹.
+// rejectUnauthorized: false Ð½ÑŒ Azure-Ð¸Ð¹Ð½ Ó©Ð³Ð´Ó©Ð³ ÑÐµÑ€Ñ‚Ð¸Ñ„Ð¸ÐºÐ°Ñ‚Ñ‹Ð½ chain-Ð¸Ð¹Ð³
+// Ð¾Ñ€Ð¾Ð½ Ð½ÑƒÑ‚Ð³Ð¸Ð¹Ð½ CA store-Ñ‚Ð¾Ð¹ Ñ‚Ð°Ð°Ñ€Ð°Ñ…Ð³Ò¯Ð¹ Ò¯ÐµÐ´ Ð» Ð°ÑˆÐ¸Ð³Ð»Ð°Ð³Ð´Ð°Ð½Ð° â€” Ñ…ÑÑ€ÑÐ² Ñ‚Ð°Ð½Ð°Ð¹
+// ÑÐµÑ€Ð²ÐµÑ€ Ð´ÑÑÑ€ Azure-Ð¸Ð¹Ð½ ÑÑ… ÑÐµÑ€Ñ‚Ð¸Ñ„Ð¸ÐºÐ°Ñ‚ (DigiCert Global Root G2) Ð±Ð°Ð¹Ð³Ð°Ð°
+// Ð±Ð¾Ð» Ò¯Ò¯Ð½Ð¸Ð¹Ð³ true Ð±Ð¾Ð»Ð³Ð¾Ð¶, ca-Ð³ Ñ‚Ð¾Ð´Ð¾Ñ€Ñ…Ð¾Ð¹ Ð·Ð°Ð°Ð¶ Ó©Ð³Ñ‡ Ð±Ð¾Ð»Ð½Ð¾.
+const pool = new Pool({
+  host: env.db.host,
+  port: env.db.port,
+  database: env.db.database,
+  user: env.db.user,
+  password: env.db.password,
+  ssl:
+    env.db.sslMode === 'disable'
+      ? false
+      : {
+          rejectUnauthorized: false,
+        },
+  max: 10,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 5000,
+});
+
+pool.on('error', (err) => {
+  // Idle client Ð´ÑÑÑ€ Ð³Ð°Ñ€ÑÐ°Ð½ Ð°Ð»Ð´Ð°Ð°Ð³ process-Ñ‹Ð³ ÑƒÐ½Ð°Ð³Ð°Ð°Ñ…Ð³Ò¯Ð¹Ð³ÑÑÑ€ Ð»Ð¾Ð³ Ñ…Ð¸Ð¹Ð½Ñ
+  // eslint-disable-next-line no-console
+  console.error('[db] Unexpected error on idle client', err);
+});
+
+/**
+ * Ð­Ð½Ð³Ð¸Ð¹Ð½ query â€” RLS Ð°ÑˆÐ¸Ð³Ð»Ð°Ñ… ÑˆÐ°Ð°Ñ€Ð´Ð»Ð°Ð³Ð°Ð³Ò¯Ð¹, request-Ð¸Ð¹Ð½ Ñ…ÑÑ€ÑÐ³Ð»ÑÐ³Ñ‡Ð¸Ð¹Ð½
+ * ÐºÐ¾Ð½Ñ‚ÐµÐºÑÑ‚ ÑˆÐ°Ð°Ñ€Ð´Ð°Ñ…Ð³Ò¯Ð¹ query-Ò¯Ò¯Ð´ÑÐ´ (Ð¶Ð¸ÑˆÑÑ Ð½ÑŒ login) Ð·Ð¾Ñ€Ð¸ÑƒÐ»Ð°Ð³Ð´ÑÐ°Ð½.
+ */
+function query(text, params) {
+  return pool.query(text, params);
+}
+
+/**
+ * Transaction Ð´Ð¾Ñ‚Ð¾Ñ€ Ð¾Ð»Ð¾Ð½ query Ð°Ð¶Ð¸Ð»Ð»ÑƒÑƒÐ»Ð°Ñ… ÑˆÐ°Ð°Ñ€Ð´Ð»Ð°Ð³Ð°Ñ‚Ð°Ð¹ Ñ‚Ð¾Ñ…Ð¸Ð¾Ð»Ð´Ð¾Ð»Ð´
+ * Ð°ÑˆÐ¸Ð³Ð»Ð°Ð½Ð° (Ð¶Ð¸ÑˆÑÑ Ð½ÑŒ login: failed_login_attempts ÑˆÐ¸Ð½ÑÑ‡Ð»ÑÑ… + audit
+ * Ð±Ð¸Ñ‡Ð¸Ñ… Ð·ÑÑ€Ð³Ð¸Ð¹Ð³ Ð½ÑÐ³ transaction-Ð´ Ð±Ð°Ð³Ñ‚Ð°Ð°Ñ…).
+ */
+async function withTransaction(fn) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await fn(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+module.exports = { pool, query, withTransaction };
+
+
+===== src\config\env.js =====
+
+'use strict';
+
+require('dotenv').config();
+
+const REQUIRED_VARS = [
+  'PGHOST',
+  'PGPORT',
+  'PGDATABASE',
+  'PGUSER',
+  'PGPASSWORD',
+  'ACCESS_TOKEN_SECRET',
+];
+
+function assertRequiredEnv() {
+  const missing = REQUIRED_VARS.filter((key) => !process.env[key]);
+  if (missing.length > 0) {
+    throw new Error(
+      `Ð”ÑƒÑ‚ÑƒÑƒ Ð±Ð°Ð¹Ð³Ð°Ð° environment variable(ÑƒÑƒÐ´): ${missing.join(', ')}. .env Ñ„Ð°Ð¹Ð»Ð°Ð° .env.example-Ñ‚ÑÐ¹ Ñ…Ð°Ñ€ÑŒÑ†ÑƒÑƒÐ»Ð¶ ÑˆÐ°Ð»Ð³Ð°Ð½Ð° ÑƒÑƒ.`
+    );
+  }
+
+  if (
+    process.env.NODE_ENV === 'production' &&
+    process.env.ACCESS_TOKEN_SECRET === 'change_this_to_a_long_random_secret'
+  ) {
+    throw new Error(
+      'ACCESS_TOKEN_SECRET Ð½ÑŒ production Ð´ÑÑÑ€ default ÑƒÑ‚Ð³Ð°Ð°Ñ€Ð°Ð° Ð±Ð°Ð¹Ð½Ð°. Random ÑƒÑ‚Ð³Ð°Ð°Ñ€ ÑÐ¾Ð»Ð¸Ð½Ð¾ ÑƒÑƒ.'
+    );
+  }
+}
+
+assertRequiredEnv();
+
+module.exports = {
+  nodeEnv: process.env.NODE_ENV || 'development',
+  port: parseInt(process.env.PORT || '4000', 10),
+  corsOrigins: (process.env.CORS_ORIGINS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean),
+
+  db: {
+    host: process.env.PGHOST,
+    port: parseInt(process.env.PGPORT || '5432', 10),
+    database: process.env.PGDATABASE,
+    user: process.env.PGUSER,
+    password: process.env.PGPASSWORD,
+    sslMode: process.env.PGSSLMODE || 'require',
+  },
+
+  jwt: {
+    accessTokenSecret: process.env.ACCESS_TOKEN_SECRET,
+    accessTokenTtl: process.env.ACCESS_TOKEN_TTL || '30m',
+    refreshTokenTtlDays: parseInt(process.env.REFRESH_TOKEN_TTL_DAYS || '7', 10),
+  },
+
+  security: {
+    maxFailedLoginAttempts: parseInt(process.env.MAX_FAILED_LOGIN_ATTEMPTS || '5', 10),
+    lockoutMinutes: parseInt(process.env.LOCKOUT_MINUTES || '15', 10),
+  },
+
+  // Ð—Ð°Ð°Ð²Ð°Ð» Ð±Ð¸Ñˆ â€” Ñ‚Ð¾Ñ…Ð¸Ñ€ÑƒÑƒÐ»Ð°Ð°Ð³Ò¯Ð¹ Ð±Ð¾Ð» Ð·Ó©Ð²Ñ…Ó©Ð½ Ð»Ð¾Ð³Ð¾ upload feature Ð¸Ð´ÑÐ²Ñ…Ð³Ò¯Ð¹ Ð±Ð¾Ð»Ð½Ð¾,
+  // ÑÐµÑ€Ð²ÐµÑ€ Ð±ÑƒÑÐ°Ð´ Ð±Ò¯Ñ… Ð·Ò¯Ð¹Ð»Ð´ÑÑ Ñ…ÑÐ²Ð¸Ð¹Ð½ Ð°Ð¶Ð¸Ð»Ð»Ð°Ð½Ð°.
+  azureStorage: {
+    accountName: process.env.AZURE_STORAGE_ACCOUNT_NAME || null,
+    accountKey: process.env.AZURE_STORAGE_ACCOUNT_KEY || null,
+    container: process.env.AZURE_STORAGE_CONTAINER || 'company-logos',
+  },
+
+  seed: {
+    superAdminEmail: process.env.SUPER_ADMIN_EMAIL,
+    superAdminPassword: process.env.SUPER_ADMIN_PASSWORD,
+    superAdminFullName: process.env.SUPER_ADMIN_FULL_NAME || 'Super Admin',
+  },
+};
+
+===== src\controllers\analyticsController.js =====
+
+'use strict';
+
+const { query } = require('../config/db');
+
+const VALID_STATUSES = ['pending', 'accepted', 'rejected'];
+
+function buildWhere(req) {
+  const { role, companyId } = req.auth;
+  const conditions = ['fs.deleted_at IS NULL'];
+  const params = [];
+
+  if (role === 'company') {
+    params.push(companyId);
+    conditions.push(`fs.company_id = $${params.length}`);
+  } else if (req.query.companyId) {
+    params.push(req.query.companyId);
+    conditions.push(`fs.company_id = $${params.length}`);
+  }
+
+  if (req.query.departmentId) {
+    params.push(req.query.departmentId);
+    conditions.push(`fs.department_id = $${params.length}`);
+  }
+  if (req.query.status && VALID_STATUSES.includes(req.query.status)) {
+    params.push(req.query.status);
+    conditions.push(`fs.status = $${params.length}`);
+  }
+  if (req.query.from) {
+    params.push(req.query.from);
+    conditions.push(`fs.created_at >= $${params.length}`);
+  }
+  if (req.query.to) {
+    params.push(req.query.to);
+    conditions.push(`fs.created_at <= $${params.length}`);
+  }
+
+  return { where: conditions.join(' AND '), params };
+}
+
+async function analytics(req, res, next) {
+  try {
+    const { where, params } = buildWhere(req);
+    const { role, companyId } = req.auth;
+
+    const totalsByStatus = await query(
+      `SELECT fs.status, COUNT(*)::int AS count FROM form_submissions fs WHERE ${where} GROUP BY fs.status`,
+      params
+    );
+
+    const overTime = await query(
+      `SELECT to_char(date_trunc('month', fs.created_at), 'YYYY-MM') AS period, COUNT(*)::int AS count
+       FROM form_submissions fs WHERE ${where} GROUP BY period ORDER BY period`,
+      params
+    );
+
+    // super_admin ÐºÐ¾Ð¼Ð¿Ð°Ð½Ð¸ ÑÐ¾Ð½Ð³Ð¾Ð¾Ð³Ò¯Ð¹ Ð±Ð¾Ð» ÐºÐ¾Ð¼Ð¿Ð°Ð½Ð¸Ð°Ñ€, Ð±ÑƒÑÐ°Ð´ Ñ‚Ð¾Ñ…Ð¸Ð¾Ð»Ð´Ð¾Ð»Ð´ Ñ…ÑÐ»Ñ‚ÑÑÑÑ€ Ð±Ò¯Ð»ÑÐ³Ð»ÑÐ½Ñ.
+    let byGroup, groupLabel;
+    if (role === 'super_admin' && !req.query.companyId) {
+      groupLabel = 'company';
+      byGroup = await query(
+        `SELECT c.id AS group_id, c.name AS group_name, COUNT(*)::int AS count
+         FROM form_submissions fs JOIN companies c ON c.id = fs.company_id
+         WHERE ${where} GROUP BY c.id, c.name ORDER BY count DESC`,
+        params
+      );
+    } else {
+      groupLabel = 'department';
+      byGroup = await query(
+        `SELECT d.id AS group_id, d.name AS group_name, COUNT(*)::int AS count
+         FROM form_submissions fs JOIN departments d ON d.id = fs.department_id
+         WHERE ${where} GROUP BY d.id, d.name ORDER BY count DESC`,
+        params
+      );
+    }
+
+    let companies = [];
+    if (role === 'super_admin') {
+      const r = await query(`SELECT id, name FROM companies WHERE deleted_at IS NULL ORDER BY name`);
+      companies = r.rows;
+    }
+
+    let deptQuery = `SELECT id, name, company_id FROM departments WHERE deleted_at IS NULL`;
+    const deptParams = [];
+    if (role === 'company') {
+      deptParams.push(companyId);
+      deptQuery += ` AND company_id = $1`;
+    } else if (req.query.companyId) {
+      deptParams.push(req.query.companyId);
+      deptQuery += ` AND company_id = $1`;
+    }
+    const departments = await query(deptQuery + ' ORDER BY name', deptParams);
+
+    return res.status(200).json({
+      totalsByStatus: totalsByStatus.rows,
+      overTime: overTime.rows,
+      byGroup: byGroup.rows,
+      groupLabel,
+      filters: { companies, departments: departments.rows },
+    });
+  } catch (err) {
+    return next(err);
+  }
+}
+
+module.exports = { analytics };
+
+===== src\controllers\authController.js =====
+
+"use strict";
+
+const { z } = require("zod");
+const authService = require("../services/authService");
+const env = require("../config/env");
+
+const loginSchema = z.object({
+  email: z.string().email("Ð˜Ð¼ÑÐ¹Ð» Ñ…Ð°ÑÐ³ Ð±ÑƒÑ€ÑƒÑƒ Ð±Ð°Ð¹Ð½Ð°."),
+  password: z.string().min(1, "ÐÑƒÑƒÑ† Ò¯Ð³ Ð¾Ñ€ÑƒÑƒÐ»Ð½Ð° ÑƒÑƒ."),
+});
+
+const REFRESH_COOKIE_NAME = "refresh_token";
+
+function refreshCookieOptions() {
+  return {
+    httpOnly: true,
+    secure: env.nodeEnv === "production",
+    sameSite: "strict",
+    path: "/api/auth", // Ð·Ó©Ð²Ñ…Ó©Ð½ auth endpoint-Ò¯Ò¯Ð´ÑÐ´ Ð¸Ð»Ð³ÑÑÐ³Ð´ÑÐ½Ñ
+    maxAge: env.jwt.refreshTokenTtlDays * 24 * 60 * 60 * 1000,
+  };
+}
+
+function getRequestMeta(req) {
+  return {
+    ipAddress: req.ip,
+    userAgent: req.headers["user-agent"] || null,
+  };
+}
+
+async function login(req, res, next) {
+  try {
+    const { email, password } = loginSchema.parse(req.body);
+    const { ipAddress, userAgent } = getRequestMeta(req);
+
+    const result = await authService.login({
+      email,
+      password,
+      ipAddress,
+      userAgent,
+    });
+
+    res.cookie(
+      REFRESH_COOKIE_NAME,
+      result.refreshToken,
+      refreshCookieOptions(),
+    );
+
+    return res.status(200).json({
+      accessToken: result.accessToken,
+      accessTokenExpiresIn: env.jwt.accessTokenTtl,
+      user: result.user,
+    });
+  } catch (err) {
+    return next(err);
+  }
+}
+
+async function refresh(req, res, next) {
+  try {
+    const refreshToken = req.cookies?.[REFRESH_COOKIE_NAME];
+    const { ipAddress, userAgent } = getRequestMeta(req);
+
+    const result = await authService.refreshAccessToken({
+      refreshToken,
+      ipAddress,
+      userAgent,
+    });
+
+    res.cookie(
+      REFRESH_COOKIE_NAME,
+      result.refreshToken,
+      refreshCookieOptions(),
+    );
+
+    return res.status(200).json({
+      accessToken: result.accessToken,
+      accessTokenExpiresIn: env.jwt.accessTokenTtl,
+      user: result.user,
+    });
+  } catch (err) {
+    return next(err);
+  }
+}
+
+async function logout(req, res, next) {
+  try {
+    const refreshToken = req.cookies?.[REFRESH_COOKIE_NAME];
+    const { ipAddress, userAgent } = getRequestMeta(req);
+
+    await authService.logout({
+      refreshToken,
+      userId: req.auth ? req.auth.userId : null,
+      ipAddress,
+      userAgent,
+    });
+
+    res.clearCookie(REFRESH_COOKIE_NAME, { path: "/api/auth" });
+    return res.status(204).send();
+  } catch (err) {
+    return next(err);
+  }
+}
+
+async function me(req, res, next) {
+  try {
+    const result = await require("../config/db").query(
+      `SELECT id, email, full_name, role, company_id, department_id, last_login_at
+       FROM users WHERE id = $1`,
+      [req.auth.userId],
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Ð¥ÑÑ€ÑÐ³Ð»ÑÐ³Ñ‡ Ð¾Ð»Ð´ÑÐ¾Ð½Ð³Ò¯Ð¹." });
+    }
+    return res.status(200).json({ user: result.rows[0] });
+  } catch (err) {
+    return next(err);
+  }
+}
+
+module.exports = { login, refresh, logout, me };
+
+
+===== src\controllers\companyController.js =====
+
+"use strict";
+
+const { z } = require("zod");
+const { query, withTransaction } = require("../config/db");
+const auditService = require("../services/auditService");
+const blobService = require("../services/blobService");
+const userService = require("../services/userService");
+const { hashPassword } = require("../services/authService");
+
+const PHONE_REGEX = /^[0-9+\-\s()]{6,20}$/;
+const UUID_REGEX =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+const createCompanySchema = z.object({
+  name: z
+    .string()
+    .trim()
+    .min(2, "ÐšÐ¾Ð¼Ð¿Ð°Ð½Ð¸Ð¹Ð½ Ð½ÑÑ€ Ð´Ð¾Ñ€ Ñ…Ð°ÑÐ¶ 2 Ñ‚ÑÐ¼Ð´ÑÐ³Ñ‚Ñ‚ÑÐ¹ Ð±Ð°Ð¹Ñ… Ñ‘ÑÑ‚Ð¾Ð¹.")
+    .max(200),
+  phone: z
+    .string()
+    .trim()
+    .regex(PHONE_REGEX, "Ð£Ñ‚Ð°ÑÐ½Ñ‹ Ð´ÑƒÐ³Ð°Ð°Ñ€ Ð±ÑƒÑ€ÑƒÑƒ Ñ„Ð¾Ñ€Ð¼Ð°Ñ‚Ñ‚Ð°Ð¹ Ð±Ð°Ð¹Ð½Ð°."),
+  logo_url: z.string().url("Ð›Ð¾Ð³Ð¾Ð½Ñ‹ URL Ð±ÑƒÑ€ÑƒÑƒ Ð±Ð°Ð¹Ð½Ð°.").optional().nullable(),
+  admin_full_name: z.string().trim().min(2, "ÐÐ´Ð¼Ð¸Ð½Ñ‹ Ð½ÑÑ€Ð¸Ð¹Ð³ Ð¾Ñ€ÑƒÑƒÐ»Ð½Ð° ÑƒÑƒ."),
+  admin_email: z.string().trim().email("Ð˜Ð¼ÑÐ¹Ð» Ñ…Ð°ÑÐ³ Ð±ÑƒÑ€ÑƒÑƒ Ð±Ð°Ð¹Ð½Ð°."),
+  admin_password: z
+    .string()
+    .min(10, "ÐÑƒÑƒÑ† Ò¯Ð³ Ð´Ð¾Ñ€ Ñ…Ð°ÑÐ¶ 10 Ñ‚ÑÐ¼Ð´ÑÐ³Ñ‚Ñ‚ÑÐ¹ Ð±Ð°Ð¹Ñ… Ñ‘ÑÑ‚Ð¾Ð¹."),
+});
+
+const updateCompanySchema = z
+  .object({
+    name: z.string().trim().min(2).max(200).optional(),
+    phone: z
+      .string()
+      .trim()
+      .regex(PHONE_REGEX, "Ð£Ñ‚Ð°ÑÐ½Ñ‹ Ð´ÑƒÐ³Ð°Ð°Ñ€ Ð±ÑƒÑ€ÑƒÑƒ Ñ„Ð¾Ñ€Ð¼Ð°Ñ‚Ñ‚Ð°Ð¹ Ð±Ð°Ð¹Ð½Ð°.")
+      .optional(),
+    logo_url: z.string().url().optional().nullable(),
+    is_active: z.boolean().optional(),
+    // Ð­Ð´Ð³ÑÑÑ€ 3 Ð½ÑŒ ÐºÐ¾Ð¼Ð¿Ð°Ð½Ð¸Ð¹Ð½ CEO/admin login-Ð¸Ð¹Ð³ Ð—ÐÐ¡ÐÐ¥ÐÐ” Ð·Ð¾Ñ€Ð¸ÑƒÐ»Ð°Ð³Ð´ÑÐ°Ð½ â€”
+    // company table-Ð¸Ð¹Ð½ Ð±Ð°Ð³Ð°Ð½Ð° Ð±Ð¸Ñˆ, users table-Ð´ Ñ…Ð°Ð¼Ð°Ð°Ñ€Ð½Ð° (Ð´Ð¾Ð¾Ñ€
+    // Ñ‚ÑƒÑÐ°Ð´ Ð½ÑŒ Ð±Ð¾Ð»Ð¾Ð²ÑÑ€ÑƒÑƒÐ»Ð°Ð³Ð´Ð°Ð½Ð°).
+    admin_full_name: z
+      .string()
+      .trim()
+      .min(2, "ÐÐ´Ð¼Ð¸Ð½Ñ‹ Ð½ÑÑ€Ð¸Ð¹Ð³ Ð¾Ñ€ÑƒÑƒÐ»Ð½Ð° ÑƒÑƒ.")
+      .optional(),
+    admin_email: z.string().trim().email("Ð˜Ð¼ÑÐ¹Ð» Ñ…Ð°ÑÐ³ Ð±ÑƒÑ€ÑƒÑƒ Ð±Ð°Ð¹Ð½Ð°.").optional(),
+    admin_password: z
+      .string()
+      .min(10, "ÐÑƒÑƒÑ† Ò¯Ð³ Ð´Ð¾Ñ€ Ñ…Ð°ÑÐ¶ 10 Ñ‚ÑÐ¼Ð´ÑÐ³Ñ‚Ñ‚ÑÐ¹ Ð±Ð°Ð¹Ñ… Ñ‘ÑÑ‚Ð¾Ð¹.")
+      .optional(),
+  })
+  .refine((data) => Object.keys(data).length > 0, {
+    message: "Ð¨Ð¸Ð½ÑÑ‡Ð»ÑÑ… Ð·Ò¯Ð¹Ð» Ð°Ð»Ð³Ð°.",
+  });
+
+const logoUploadUrlSchema = z.object({
+  fileName: z.string().min(1),
+  contentType: z.enum(["image/png", "image/jpeg", "image/webp"], {
+    errorMap: () => ({
+      message: "Ð—Ó©Ð²Ñ…Ó©Ð½ PNG, JPEG, WEBP Ð·ÑƒÑ€Ð°Ð³ Ð·Ó©Ð²ÑˆÓ©Ó©Ñ€Ó©Ð³Ð´Ó©Ð½Ó©.",
+    }),
+  }),
+});
+ 
+function assertValidId(id, res) {
+  if (!UUID_REGEX.test(id)) {
+    res.status(400).json({ error: "ID Ð±ÑƒÑ€ÑƒÑƒ Ð±Ð°Ð¹Ð½Ð°." });
+    return false;
+  }
+  return true;
+}
+
+async function list(req, res, next) {
+  try {
+    const result = await query(
+      `SELECT c.id, c.name, c.phone, c.logo_url, c.is_active, c.created_at, c.updated_at,
+              u.id AS admin_id, u.full_name AS admin_full_name, u.email AS admin_email
+       FROM companies c
+       LEFT JOIN users u ON u.company_id = c.id AND u.role = 'company' AND u.deleted_at IS NULL
+       WHERE c.deleted_at IS NULL
+       ORDER BY c.created_at DESC`,
+    );
+    return res.status(200).json({ companies: result.rows });
+  } catch (err) {
+    return next(err);
+  }
+}
+
+async function create(req, res, next) {
+  try {
+    const {
+      name,
+      phone,
+      logo_url,
+      admin_full_name,
+      admin_email,
+      admin_password,
+    } = createCompanySchema.parse(req.body);
+
+    const existingCompany = await query(
+      `SELECT id FROM companies WHERE lower(name) = lower($1) AND deleted_at IS NULL`,
+      [name],
+    );
+    if (existingCompany.rows.length > 0) {
+      return res
+        .status(409)
+        .json({ error: "Ð˜Ð¹Ð¼ Ð½ÑÑ€Ñ‚ÑÐ¹ ÐºÐ¾Ð¼Ð¿Ð°Ð½Ð¸ Ð°Ð»ÑŒ Ñ…ÑÐ´Ð¸Ð¹Ð½ Ð±Ò¯Ñ€Ñ‚Ð³ÑÐ»Ñ‚ÑÐ¹ Ð±Ð°Ð¹Ð½Ð°." });
+    }
+
+    const { company, adminUser } = await withTransaction(async (client) => {
+      const companyResult = await client.query(
+        `INSERT INTO companies (name, phone, logo_url)
+         VALUES ($1, $2, $3)
+         RETURNING id, name, phone, logo_url, is_active, created_at, updated_at`,
+        [name, phone, logo_url || null],
+      );
+      const companyRow = companyResult.rows[0];
+
+      const adminUserRow = await userService.createLinkedUser(client, {
+        email: admin_email,
+        password: admin_password,
+        fullName: admin_full_name,
+        role: "company",
+        companyId: companyRow.id,
+      });
+
+      return { company: companyRow, adminUser: adminUserRow };
+    });
+
+    await auditService.logEvent({
+      userId: req.auth.userId,
+      action: "COMPANY_CREATED",
+      ipAddress: req.ip,
+      userAgent: req.headers["user-agent"] || null,
+      metadata: {
+        companyId: company.id,
+        name: company.name,
+        adminUserId: adminUser.id,
+      },
+    });
+
+    return res.status(201).json({
+      company: {
+        ...company,
+        admin_id: adminUser.id,
+        admin_full_name: adminUser.full_name,
+        admin_email: adminUser.email,
+      },
+    });
+  } catch (err) {
+    if (err.statusCode) {
+      return res.status(err.statusCode).json({ error: err.message });
+    }
+    return next(err);
+  }
+}
+
+async function update(req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!assertValidId(id, res)) return;
+
+    const raw = updateCompanySchema.parse(req.body);
+    const { admin_full_name, admin_email, admin_password, ...companyUpdates } =
+      raw;
+
+    const existing = await query(
+      `SELECT id FROM companies WHERE id = $1 AND deleted_at IS NULL`,
+      [id],
+    );
+    if (existing.rows.length === 0) {
+      return res.status(404).json({ error: "ÐšÐ¾Ð¼Ð¿Ð°Ð½Ð¸ Ð¾Ð»Ð´ÑÐ¾Ð½Ð³Ò¯Ð¹." });
+    }
+
+    if (companyUpdates.name) {
+      const dup = await query(
+        `SELECT id FROM companies WHERE lower(name) = lower($1) AND deleted_at IS NULL AND id != $2`,
+        [companyUpdates.name, id],
+      );
+      if (dup.rows.length > 0) {
+        return res
+          .status(409)
+          .json({ error: "Ð˜Ð¹Ð¼ Ð½ÑÑ€Ñ‚ÑÐ¹ ÐºÐ¾Ð¼Ð¿Ð°Ð½Ð¸ Ð°Ð»ÑŒ Ñ…ÑÐ´Ð¸Ð¹Ð½ Ð±Ò¯Ñ€Ñ‚Ð³ÑÐ»Ñ‚ÑÐ¹ Ð±Ð°Ð¹Ð½Ð°." });
+      }
+    }
+
+    let updatedCompany;
+    let updatedAdmin = null;
+
+    await withTransaction(async (client) => {
+      // ---- ÐšÐ¾Ð¼Ð¿Ð°Ð½Ð¸Ð¹Ð½ Ñ‚Ð°Ð»Ð±Ð°Ñ€ÑƒÑƒÐ´ (name/phone/logo_url/is_active) ----
+      if (Object.keys(companyUpdates).length > 0) {
+        const setClauses = [];
+        const values = [];
+        let i = 1;
+        for (const [key, value] of Object.entries(companyUpdates)) {
+          setClauses.push(`${key} = $${i}`);
+          values.push(value);
+          i++;
+        }
+        setClauses.push("updated_at = now()");
+        values.push(id);
+
+        const result = await client.query(
+          `UPDATE companies SET ${setClauses.join(", ")} WHERE id = $${i}
+           RETURNING id, name, phone, logo_url, is_active, created_at, updated_at`,
+          values,
+        );
+        updatedCompany = result.rows[0];
+      } else {
+        const result = await client.query(
+          `SELECT id, name, phone, logo_url, is_active, created_at, updated_at FROM companies WHERE id = $1`,
+          [id],
+        );
+        updatedCompany = result.rows[0];
+      }
+
+      // ---- CEO/Admin-Ð¸Ð¹Ð½ Ð½ÑÐ²Ñ‚Ñ€ÑÑ… Ð¼ÑÐ´ÑÑÐ»ÑÐ» (users table) ----
+      if (admin_full_name || admin_email || admin_password) {
+        const adminRow = await client.query(
+          `SELECT id FROM users WHERE company_id = $1 AND role = 'company' AND deleted_at IS NULL LIMIT 1`,
+          [id],
+        );
+        if (adminRow.rows.length === 0) {
+          const err = new Error("ÐšÐ¾Ð¼Ð¿Ð°Ð½Ð¸Ð¹Ð½ Ð°Ð´Ð¼Ð¸Ð½ Ñ…ÑÑ€ÑÐ³Ð»ÑÐ³Ñ‡ Ð¾Ð»Ð´ÑÐ¾Ð½Ð³Ò¯Ð¹.");
+          err.statusCode = 404;
+          throw err;
+        }
+        const adminId = adminRow.rows[0].id;
+
+        if (admin_email) {
+          const dupUser = await client.query(
+            `SELECT id FROM users WHERE lower(email) = lower($1) AND deleted_at IS NULL AND id != $2`,
+            [admin_email, adminId],
+          );
+          if (dupUser.rows.length > 0) {
+            const err = new Error(
+              "Ð­Ð½Ñ Ð¸Ð¼ÑÐ¹Ð» Ñ…Ð°ÑÐ³ Ó©Ó©Ñ€ Ñ…ÑÑ€ÑÐ³Ð»ÑÐ³Ñ‡Ð¸Ð´ Ð±Ò¯Ñ€Ñ‚Ð³ÑÐ»Ñ‚ÑÐ¹ Ð±Ð°Ð¹Ð½Ð°.",
+            );
+            err.statusCode = 409;
+            throw err;
+          }
+        }
+
+        const adminSetClauses = [];
+        const adminValues = [];
+        let j = 1;
+
+        if (admin_full_name) {
+          adminSetClauses.push(`full_name = $${j}`);
+          adminValues.push(admin_full_name);
+          j++;
+        }
+        if (admin_email) {
+          adminSetClauses.push(`email = $${j}`);
+          adminValues.push(admin_email);
+          j++;
+        }
+        if (admin_password) {
+          const passwordHash = await hashPassword(admin_password);
+          adminSetClauses.push(`password_hash = $${j}`);
+          adminValues.push(passwordHash);
+          j++;
+        }
+        adminSetClauses.push("updated_at = now()");
+        adminValues.push(adminId);
+
+        const adminResult = await client.query(
+          `UPDATE users SET ${adminSetClauses.join(", ")} WHERE id = $${j}
+           RETURNING id, email, full_name`,
+          adminValues,
+        );
+        updatedAdmin = adminResult.rows[0];
+      } else {
+        // Admin Ñ‚Ð°Ð»Ð±Ð°Ñ€ Ó©Ó©Ñ€Ñ‡Ð»Ó©Ð³Ð´Ó©Ó©Ð³Ò¯Ð¹ Ñ‡, response Ð´Ð¾Ñ‚Ð¾Ñ€ Ð¾Ð´Ð¾Ð¾ Ð±Ð°Ð¹Ð³Ð°Ð°
+        // admin Ð¼ÑÐ´ÑÑÐ»Ð»Ð¸Ð¹Ð³ Ð» Ð±ÑƒÑ†Ð°Ð°Ð½Ð° (frontend Ð´Ð°Ñ…Ð¸Ð½ Ð°Ñ‡Ð°Ð°Ð»Ð°Ñ…Ð³Ò¯Ð¹Ð³ÑÑÑ€
+        // Ð¶Ð°Ð³ÑÐ°Ð°Ð»Ñ‚Ð°Ð° ÑˆÐ¸Ð½ÑÑ‡Ð¸Ð»Ð¶ Ñ‡Ð°Ð´Ð°Ñ…).
+        const adminRow = await client.query(
+          `SELECT id, email, full_name FROM users WHERE company_id = $1 AND role = 'company' AND deleted_at IS NULL LIMIT 1`,
+          [id],
+        );
+        updatedAdmin = adminRow.rows[0] || null;
+      }
+    });
+
+    await auditService.logEvent({
+      userId: req.auth.userId,
+      action: "COMPANY_UPDATED",
+      ipAddress: req.ip,
+      userAgent: req.headers["user-agent"] || null,
+      metadata: {
+        companyId: id,
+        companyUpdates,
+        adminChanged: !!(admin_full_name || admin_email || admin_password),
+      },
+    });
+
+    return res.status(200).json({
+      company: {
+        ...updatedCompany,
+        admin_id: updatedAdmin ? updatedAdmin.id : null,
+        admin_full_name: updatedAdmin ? updatedAdmin.full_name : null,
+        admin_email: updatedAdmin ? updatedAdmin.email : null,
+      },
+    });
+  } catch (err) {
+    if (err.statusCode) {
+      return res.status(err.statusCode).json({ error: err.message });
+    }
+    return next(err);
+  }
+}
+
+async function remove(req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!assertValidId(id, res)) return;
+
+    const existing = await query(
+      `SELECT id, name FROM companies WHERE id = $1 AND deleted_at IS NULL`,
+      [id],
+    );
+    if (existing.rows.length === 0) {
+      return res.status(404).json({ error: "ÐšÐ¾Ð¼Ð¿Ð°Ð½Ð¸ Ð¾Ð»Ð´ÑÐ¾Ð½Ð³Ò¯Ð¹." });
+    }
+
+    await query("UPDATE companies SET deleted_at = now() WHERE id = $1", [id]);
+    await query(
+      "UPDATE departments SET deleted_at = now() WHERE company_id = $1 AND deleted_at IS NULL",
+      [id],
+    );
+    await query(
+      "UPDATE users SET deleted_at = now() WHERE company_id = $1 AND deleted_at IS NULL",
+      [id],
+    );
+
+    await auditService.logEvent({
+      userId: req.auth.userId,
+      action: "COMPANY_DELETED",
+      ipAddress: req.ip,
+      userAgent: req.headers["user-agent"] || null,
+      metadata: { companyId: id, name: existing.rows[0].name },
+    });
+
+    return res.status(204).send();
+  } catch (err) {
+    return next(err);
+  }
+}
+
+async function getLogoUploadUrl(req, res, next) {
+  try {
+    const { fileName, contentType } = logoUploadUrlSchema.parse(req.body);
+    const result = blobService.generateUploadUrl(fileName, contentType);
+    return res.status(200).json(result);
+  } catch (err) {
+    if (err instanceof blobService.BlobConfigError) {
+      return res.status(err.statusCode).json({ error: err.message });
+    }
+    return next(err);
+  }
+}
+
+module.exports = { list, create, update, remove, getLogoUploadUrl };
+
+
+===== src\controllers\departmentController.js =====
+
+'use strict';
+
+const { z } = require('zod');
+const { query, withTransaction } = require('../config/db');
+const auditService = require('../services/auditService');
+const userService = require('../services/userService');
+
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+const createSchema = z.object({
+  template_id: z.string().uuid('Ð¥ÑÐ»Ñ‚ÑÑÐ¸Ð¹Ð½ Ð·Ð°Ð³Ð²Ð°Ñ€ ÑÐ¾Ð½Ð³Ð¾Ð½Ð¾ ÑƒÑƒ.'),
+  admin_full_name: z.string().trim().min(2, 'ÐÐ´Ð¼Ð¸Ð½Ñ‹ Ð½ÑÑ€Ð¸Ð¹Ð³ Ð¾Ñ€ÑƒÑƒÐ»Ð½Ð° ÑƒÑƒ.'),
+  admin_email: z.string().trim().email('Ð˜Ð¼ÑÐ¹Ð» Ñ…Ð°ÑÐ³ Ð±ÑƒÑ€ÑƒÑƒ Ð±Ð°Ð¹Ð½Ð°.'),
+  admin_password: z.string().min(10, 'ÐÑƒÑƒÑ† Ò¯Ð³ Ð´Ð¾Ñ€ Ñ…Ð°ÑÐ¶ 10 Ñ‚ÑÐ¼Ð´ÑÐ³Ñ‚Ñ‚ÑÐ¹ Ð±Ð°Ð¹Ñ… Ñ‘ÑÑ‚Ð¾Ð¹.'),
+});
+
+async function list(req, res, next) {
+  try {
+    const result = await query(
+      `SELECT d.id, d.name, d.is_active, d.created_at, d.updated_at, d.template_id,
+              u.id AS admin_id, u.email AS admin_email, u.full_name AS admin_full_name
+       FROM departments d
+       LEFT JOIN users u ON u.department_id = d.id AND u.role = 'department' AND u.deleted_at IS NULL
+       WHERE d.company_id = $1 AND d.deleted_at IS NULL
+       ORDER BY d.created_at DESC`,
+      [req.auth.companyId]
+    );
+    return res.status(200).json({ departments: result.rows });
+  } catch (err) {
+    return next(err);
+  }
+}
+
+// Super_admin â€” Ð‘Ò®Ð¥ ÐºÐ¾Ð¼Ð¿Ð°Ð½Ð¸Ð¹Ð½ Ð‘Ò®Ð¥ Ñ…ÑÐ»Ñ‚ÑÑ (ÐºÐ¾Ð¼Ð¿Ð°Ð½Ð¸Ð¹Ð½ Ð½ÑÑ€Ñ‚ÑÐ¹ Ñ…Ð°Ð¼Ñ‚).
+async function listAll(req, res, next) {
+  try {
+    const result = await query(
+      `SELECT d.id, d.name, d.is_active, d.created_at, d.updated_at, d.template_id,
+              c.id AS company_id, c.name AS company_name,
+              u.id AS admin_id, u.email AS admin_email, u.full_name AS admin_full_name
+       FROM departments d
+       JOIN companies c ON c.id = d.company_id
+       LEFT JOIN users u ON u.department_id = d.id AND u.role = 'department' AND u.deleted_at IS NULL
+       WHERE d.deleted_at IS NULL
+       ORDER BY c.name ASC, d.name ASC`
+    );
+    return res.status(200).json({ departments: result.rows });
+  } catch (err) {
+    return next(err);
+  }
+}
+
+async function mine(req, res, next) {
+  try {
+    const result = await query(
+      `SELECT d.id, d.name, d.template_id, dt.form_schema
+       FROM departments d
+       JOIN department_templates dt ON dt.id = d.template_id
+       WHERE d.id = $1 AND d.deleted_at IS NULL`,
+      [req.auth.departmentId]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Ð¥ÑÐ»Ñ‚ÑÑ Ð¾Ð»Ð´ÑÐ¾Ð½Ð³Ò¯Ð¹.' });
+    }
+    return res.status(200).json({ department: result.rows[0] });
+  } catch (err) {
+    return next(err);
+  }
+}
+
+async function create(req, res, next) {
+  try {
+    const { template_id, admin_full_name, admin_email, admin_password } = createSchema.parse(req.body);
+    const companyId = req.auth.companyId;
+
+    const template = await query(
+      `SELECT id, name FROM department_templates WHERE id = $1 AND deleted_at IS NULL`,
+      [template_id]
+    );
+    if (template.rows.length === 0) {
+      return res.status(404).json({ error: 'Ð¥ÑÐ»Ñ‚ÑÑÐ¸Ð¹Ð½ Ð·Ð°Ð³Ð²Ð°Ñ€ Ð¾Ð»Ð´ÑÐ¾Ð½Ð³Ò¯Ð¹.' });
+    }
+
+    const existingDept = await query(
+      `SELECT id FROM departments WHERE company_id = $1 AND template_id = $2 AND deleted_at IS NULL`,
+      [companyId, template_id]
+    );
+    if (existingDept.rows.length > 0) {
+      return res.status(409).json({ error: 'Ð­Ð½Ñ Ñ…ÑÐ»Ñ‚ÑÑ Ð°Ð»ÑŒ Ñ…ÑÐ´Ð¸Ð¹Ð½ Ò¯Ò¯ÑÑÑÐ½ Ð±Ð°Ð¹Ð½Ð°.' });
+    }
+
+    const { department, adminUser } = await withTransaction(async (client) => {
+      const deptResult = await client.query(
+        `INSERT INTO departments (company_id, template_id, name)
+         VALUES ($1, $2, $3)
+         RETURNING id, company_id, template_id, name, is_active, created_at, updated_at`,
+        [companyId, template_id, template.rows[0].name]
+      );
+      const deptRow = deptResult.rows[0];
+
+      const adminUserRow = await userService.createLinkedUser(client, {
+        email: admin_email,
+        password: admin_password,
+        fullName: admin_full_name,
+        role: 'department',
+        companyId,
+        departmentId: deptRow.id,
+      });
+
+      return { department: deptRow, adminUser: adminUserRow };
+    });
+
+    await auditService.logEvent({
+      userId: req.auth.userId,
+      action: 'DEPARTMENT_CREATED',
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'] || null,
+      metadata: { departmentId: department.id, companyId, adminUserId: adminUser.id },
+    });
+
+    return res.status(201).json({
+      department: {
+        ...department,
+        admin_id: adminUser.id,
+        admin_email: adminUser.email,
+        admin_full_name: adminUser.full_name,
+      },
+    });
+  } catch (err) {
+    if (err.statusCode) {
+      return res.status(err.statusCode).json({ error: err.message });
+    }
+    return next(err);
+  }
+}
+
+async function remove(req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!UUID_REGEX.test(id)) {
+      return res.status(400).json({ error: 'ID Ð±ÑƒÑ€ÑƒÑƒ Ð±Ð°Ð¹Ð½Ð°.' });
+    }
+
+    const existing = await query(
+      `SELECT id FROM departments WHERE id = $1 AND company_id = $2 AND deleted_at IS NULL`,
+      [id, req.auth.companyId]
+    );
+    if (existing.rows.length === 0) {
+      return res.status(404).json({ error: 'Ð¥ÑÐ»Ñ‚ÑÑ Ð¾Ð»Ð´ÑÐ¾Ð½Ð³Ò¯Ð¹.' });
+    }
+
+    await query('UPDATE departments SET deleted_at = now() WHERE id = $1', [id]);
+    await query('UPDATE users SET deleted_at = now() WHERE department_id = $1 AND deleted_at IS NULL', [id]);
+
+    await auditService.logEvent({
+      userId: req.auth.userId,
+      action: 'DEPARTMENT_DELETED',
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'] || null,
+      metadata: { departmentId: id, companyId: req.auth.companyId },
+    });
+
+    return res.status(204).send();
+  } catch (err) {
+    return next(err);
+  }
+}
+
+module.exports = { list, listAll, mine, create, remove };
+
+===== src\controllers\departmentTemplateController.js =====
+
+'use strict';
+
+const { z } = require('zod');
+const { query } = require('../config/db');
+const auditService = require('../services/auditService');
+
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+const formFieldSchema = z.object({
+  label: z.string().trim().min(1, 'Ð¢Ð°Ð»Ð±Ð°Ñ€Ñ‹Ð½ Ð½ÑÑ€Ð¸Ð¹Ð³ Ð¾Ñ€ÑƒÑƒÐ»Ð½Ð° ÑƒÑƒ.'),
+  unit: z.string().trim().optional().default(''),
+  frequency: z.enum(['Ð¡Ð°Ñ€', 'Ð£Ð»Ð¸Ñ€Ð°Ð»', 'Ð–Ð¸Ð»']),
+  type: z.enum(['number', 'text']),
+  required: z.boolean().default(true),
+  active: z.boolean().default(true),
+});
+
+const createSchema = z.object({
+  name: z.string().trim().min(2, 'ÐÑÑ€ Ð´Ð¾Ñ€ Ñ…Ð°ÑÐ¶ 2 Ñ‚ÑÐ¼Ð´ÑÐ³Ñ‚Ñ‚ÑÐ¹ Ð±Ð°Ð¹Ñ… Ñ‘ÑÑ‚Ð¾Ð¹.').max(100),
+});
+
+const updateSchema = z
+  .object({
+    name: z.string().trim().min(2).max(100).optional(),
+    form_schema: z.array(formFieldSchema).optional(),
+  })
+  .refine((d) => Object.keys(d).length > 0, { message: 'Ð¨Ð¸Ð½ÑÑ‡Ð»ÑÑ… Ð·Ò¯Ð¹Ð» Ð°Ð»Ð³Ð°.' });
+
+async function list(req, res, next) {
+  try {
+    const result = await query(
+      `SELECT id, name, form_schema, is_active, created_at, updated_at
+       FROM department_templates WHERE deleted_at IS NULL ORDER BY name ASC`
+    );
+    return res.status(200).json({ templates: result.rows });
+  } catch (err) {
+    return next(err);
+  }
+}
+
+async function create(req, res, next) {
+  try {
+    const { name } = createSchema.parse(req.body);
+
+    const existing = await query(
+      `SELECT id FROM department_templates WHERE lower(name) = lower($1) AND deleted_at IS NULL`,
+      [name]
+    );
+    if (existing.rows.length > 0) {
+      return res.status(409).json({ error: 'Ð˜Ð¹Ð¼ Ð½ÑÑ€Ñ‚ÑÐ¹ Ñ…ÑÐ»Ñ‚ÑÑÐ¸Ð¹Ð½ Ð·Ð°Ð³Ð²Ð°Ñ€ Ð°Ð»ÑŒ Ñ…ÑÐ´Ð¸Ð¹Ð½ Ð±Ð°Ð¹Ð½Ð°.' });
+    }
+
+    const result = await query(
+      `INSERT INTO department_templates (name) VALUES ($1)
+       RETURNING id, name, form_schema, is_active, created_at, updated_at`,
+      [name]
+    );
+
+    await auditService.logEvent({
+      userId: req.auth.userId,
+      action: 'DEPARTMENT_TEMPLATE_CREATED',
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'] || null,
+      metadata: { templateId: result.rows[0].id, name },
+    });
+
+    return res.status(201).json({ template: result.rows[0] });
+  } catch (err) {
+    return next(err);
+  }
+}
+
+// ÐÑÑ€ Ð±Ð¾Ð»Ð¾Ð½/ÑÑÐ²ÑÐ» form_schema-Ð³ ÑˆÐ¸Ð½ÑÑ‡Ð»ÑÑ… â€” "Ð¢Ð°Ð»Ð±Ð°Ñ€ ÑƒÐ´Ð¸Ñ€Ð´Ð°Ñ…" UI ÑÐ½Ð¸Ð¹Ð³ Ð´ÑƒÑƒÐ´Ð½Ð°.
+async function update(req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!UUID_REGEX.test(id)) {
+      return res.status(400).json({ error: 'ID Ð±ÑƒÑ€ÑƒÑƒ Ð±Ð°Ð¹Ð½Ð°.' });
+    }
+
+    const updates = updateSchema.parse(req.body);
+
+    const existing = await query(
+      `SELECT id FROM department_templates WHERE id = $1 AND deleted_at IS NULL`,
+      [id]
+    );
+    if (existing.rows.length === 0) {
+      return res.status(404).json({ error: 'Ð—Ð°Ð³Ð²Ð°Ñ€ Ð¾Ð»Ð´ÑÐ¾Ð½Ð³Ò¯Ð¹.' });
+    }
+
+    const setClauses = [];
+    const values = [];
+    let i = 1;
+    if (updates.name) {
+      setClauses.push(`name = $${i}`);
+      values.push(updates.name);
+      i++;
+    }
+    if (updates.form_schema) {
+      setClauses.push(`form_schema = $${i}`);
+      values.push(JSON.stringify(updates.form_schema));
+      i++;
+    }
+    setClauses.push('updated_at = now()');
+    values.push(id);
+
+    const result = await query(
+      `UPDATE department_templates SET ${setClauses.join(', ')} WHERE id = $${i}
+       RETURNING id, name, form_schema, is_active, created_at, updated_at`,
+      values
+    );
+
+    await auditService.logEvent({
+      userId: req.auth.userId,
+      action: 'DEPARTMENT_TEMPLATE_UPDATED',
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'] || null,
+      metadata: { templateId: id },
+    });
+
+    return res.status(200).json({ template: result.rows[0] });
+  } catch (err) {
+    return next(err);
+  }
+}
+
+async function remove(req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!UUID_REGEX.test(id)) {
+      return res.status(400).json({ error: 'ID Ð±ÑƒÑ€ÑƒÑƒ Ð±Ð°Ð¹Ð½Ð°.' });
+    }
+    const existing = await query(`SELECT id, name FROM department_templates WHERE id = $1 AND deleted_at IS NULL`, [id]);
+    if (existing.rows.length === 0) {
+      return res.status(404).json({ error: 'Ð—Ð°Ð³Ð²Ð°Ñ€ Ð¾Ð»Ð´ÑÐ¾Ð½Ð³Ò¯Ð¹.' });
+    }
+    await query('UPDATE department_templates SET deleted_at = now() WHERE id = $1', [id]);
+
+    await auditService.logEvent({
+      userId: req.auth.userId,
+      action: 'DEPARTMENT_TEMPLATE_DELETED',
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'] || null,
+      metadata: { templateId: id, name: existing.rows[0].name },
+    });
+
+    return res.status(204).send();
+  } catch (err) {
+    return next(err);
+  }
+}
+
+module.exports = { list, create, update, remove };
+
+===== src\controllers\editRequestController.js =====
+
+'use strict';
+
+const { z } = require('zod');
+const { query, withTransaction } = require('../config/db');
+const auditService = require('../services/auditService');
+
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+async function list(req, res, next) {
+  try {
+    const result = await query(
+      `SELECT er.id, er.submission_id, er.reason, er.status, er.reviewed_by, er.reviewed_at, er.created_at,
+              fs.title AS submission_title, fs.data AS submission_data, fs.status AS submission_status,
+              fs.created_at AS submission_created_at,
+              c.name AS company_name, d.name AS department_name,
+              u.full_name AS requested_by_name
+       FROM submission_edit_requests er
+       JOIN form_submissions fs ON fs.id = er.submission_id
+       JOIN companies c ON c.id = fs.company_id
+       JOIN departments d ON d.id = fs.department_id
+       JOIN users u ON u.id = er.requested_by
+       ORDER BY er.created_at DESC`
+    );
+    return res.status(200).json({ requests: result.rows });
+  } catch (err) {
+    return next(err);
+  }
+}
+
+const reviewSchema = z.object({ action: z.enum(['approve', 'deny']) });
+
+async function review(req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!UUID_REGEX.test(id)) {
+      return res.status(400).json({ error: 'ID Ð±ÑƒÑ€ÑƒÑƒ Ð±Ð°Ð¹Ð½Ð°.' });
+    }
+
+    const { action } = reviewSchema.parse(req.body);
+
+    const existing = await query(
+      `SELECT id, submission_id, status FROM submission_edit_requests WHERE id = $1`,
+      [id]
+    );
+    if (existing.rows.length === 0) {
+      return res.status(404).json({ error: 'Ð¥Ò¯ÑÑÐ»Ñ‚ Ð¾Ð»Ð´ÑÐ¾Ð½Ð³Ò¯Ð¹.' });
+    }
+    if (existing.rows[0].status !== 'pending') {
+      return res.status(409).json({ error: 'Ð­Ð½Ñ Ñ…Ò¯ÑÑÐ»Ñ‚ Ð°Ð»ÑŒ Ñ…ÑÐ´Ð¸Ð¹Ð½ ÑˆÐ¸Ð¹Ð´Ð²ÑÑ€Ð»ÑÐ³Ð´ÑÑÐ½ Ð±Ð°Ð¹Ð½Ð°.' });
+    }
+
+    const newStatus = action === 'approve' ? 'approved' : 'denied';
+
+    await withTransaction(async (client) => {
+      await client.query(
+        `UPDATE submission_edit_requests SET status = $1, reviewed_by = $2, reviewed_at = now(), updated_at = now() WHERE id = $3`,
+        [newStatus, req.auth.userId, id]
+      );
+      if (action === 'approve') {
+        await client.query(`UPDATE form_submissions SET edit_unlocked = true WHERE id = $1`, [
+          existing.rows[0].submission_id,
+        ]);
+      }
+    });
+
+    await auditService.logEvent({
+      userId: req.auth.userId,
+      action: action === 'approve' ? 'EDIT_REQUEST_APPROVED' : 'EDIT_REQUEST_DENIED',
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'] || null,
+      metadata: { requestId: id, submissionId: existing.rows[0].submission_id },
+    });
+
+    return res.status(204).send();
+  } catch (err) {
+    return next(err);
+  }
+}
+
+module.exports = { list, review };
+
+===== src\controllers\formSubmissionController.js =====
+
+'use strict';
+
+const { z } = require('zod');
+const { query } = require('../config/db');
+const auditService = require('../services/auditService');
+
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+const dataFieldsSchema = z
+  .record(z.string())
+  .refine((d) => Object.keys(d).length > 0, { message: 'Ð”Ð¾Ñ€ Ñ…Ð°ÑÐ¶ Ð½ÑÐ³ Ñ‚Ð°Ð»Ð±Ð°Ñ€ Ð±Ó©Ð³Ð»Ó©Ð½Ó© Ò¯Ò¯.' });
+
+const createSchema = z.object({
+  title: z.string().trim().min(2, 'Ð¢Ð°Ð¹Ð»Ð°Ð½Ð³Ð¸Ð¹Ð½ Ð½ÑÑ€Ð¸Ð¹Ð³ Ð¾Ñ€ÑƒÑƒÐ»Ð½Ð° ÑƒÑƒ.').max(200),
+  data: dataFieldsSchema,
+});
+
+async function create(req, res, next) {
+  try {
+    const { title, data } = createSchema.parse(req.body);
+    const { companyId, departmentId, userId } = req.auth;
+
+    if (!departmentId) {
+      return res.status(400).json({ error: 'Ð¢Ð°Ð½Ð°Ð¹ Ñ…ÑÑ€ÑÐ³Ð»ÑÐ³Ñ‡ Ñ…ÑÐ»Ñ‚ÑÑÑ‚ Ñ…Ð°Ð¼Ð°Ð°Ñ€Ð°Ñ…Ð³Ò¯Ð¹ Ð±Ð°Ð¹Ð½Ð°.' });
+    }
+
+    const result = await query(
+      `INSERT INTO form_submissions (company_id, department_id, submitted_by, title, data, status)
+       VALUES ($1, $2, $3, $4, $5, 'pending')
+       RETURNING id, company_id, department_id, submitted_by, title, data, status,
+                 rejection_reason, reviewed_by, reviewed_at, edit_unlocked, created_at, updated_at`,
+      [companyId, departmentId, userId, title, JSON.stringify(data)]
+    );
+
+    await auditService.logEvent({
+      userId,
+      action: 'FORM_SUBMITTED',
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'] || null,
+      metadata: { submissionId: result.rows[0].id, departmentId },
+    });
+
+    return res.status(201).json({ submission: result.rows[0] });
+  } catch (err) {
+    return next(err);
+  }
+}
+
+// list: role Ð±Ò¯Ñ€Ñ‚ Ó©Ó©Ñ€ Ó©Ð³Ó©Ð³Ð´Ð»Ð¸Ð¹Ð½ Ñ…ÑÐ¼Ð¶ÑÑ â€”
+// - super_admin: Ð‘Ò®Ð¥ ÐºÐ¾Ð¼Ð¿Ð°Ð½Ð¸Ð¹Ð½ Ð‘Ò®Ð¥ Ñ‚Ð°Ð¹Ð»Ð°Ð½
+// - company: Ð·Ó©Ð²Ñ…Ó©Ð½ Ó©Ó©Ñ€Ð¸Ð¹Ð½ ÐºÐ¾Ð¼Ð¿Ð°Ð½Ð¸Ð¹Ð½ Ñ‚Ð°Ð¹Ð»Ð°Ð½Ð³ÑƒÑƒÐ´
+// - department: Ð·Ó©Ð²Ñ…Ó©Ð½ Ó©Ó©Ñ€Ð¸Ð¹Ð½ Ñ…ÑÐ»Ñ‚ÑÑÐ¸Ð¹Ð½ Ð¸Ð»Ð³ÑÑÑÑÐ½ Ñ‚Ð°Ð¹Ð»Ð°Ð½Ð³ÑƒÑƒÐ´
+async function list(req, res, next) {
+  try {
+    const { role, companyId, departmentId } = req.auth;
+
+    let result;
+    if (role === 'super_admin') {
+      result = await query(
+        `SELECT fs.*, d.name AS department_name, c.name AS company_name, u.full_name AS submitted_by_name
+         FROM form_submissions fs
+         JOIN departments d ON d.id = fs.department_id
+         JOIN companies c ON c.id = fs.company_id
+         JOIN users u ON u.id = fs.submitted_by
+         WHERE fs.deleted_at IS NULL
+         ORDER BY fs.created_at DESC`
+      );
+    } else if (role === 'company') {
+      result = await query(
+        `SELECT fs.*, d.name AS department_name, c.name AS company_name, u.full_name AS submitted_by_name
+         FROM form_submissions fs
+         JOIN departments d ON d.id = fs.department_id
+         JOIN companies c ON c.id = fs.company_id
+         JOIN users u ON u.id = fs.submitted_by
+         WHERE fs.company_id = $1 AND fs.deleted_at IS NULL
+         ORDER BY fs.created_at DESC`,
+        [companyId]
+      );
+    } else {
+      result = await query(
+        `SELECT fs.*, d.name AS department_name, c.name AS company_name, u.full_name AS submitted_by_name
+         FROM form_submissions fs
+         JOIN departments d ON d.id = fs.department_id
+         JOIN companies c ON c.id = fs.company_id
+         JOIN users u ON u.id = fs.submitted_by
+         WHERE fs.department_id = $1 AND fs.deleted_at IS NULL
+         ORDER BY fs.created_at DESC`,
+        [departmentId]
+      );
+    }
+
+    return res.status(200).json({ submissions: result.rows });
+  } catch (err) {
+    return next(err);
+  }
+}
+
+const resubmitSchema = z.object({
+  title: z.string().trim().min(2).max(200),
+  data: dataFieldsSchema,
+});
+
+async function resubmit(req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!UUID_REGEX.test(id)) {
+      return res.status(400).json({ error: 'ID Ð±ÑƒÑ€ÑƒÑƒ Ð±Ð°Ð¹Ð½Ð°.' });
+    }
+
+    const { title, data } = resubmitSchema.parse(req.body);
+
+    const existing = await query(
+      `SELECT id, status FROM form_submissions WHERE id = $1 AND department_id = $2 AND deleted_at IS NULL`,
+      [id, req.auth.departmentId]
+    );
+    if (existing.rows.length === 0) {
+      return res.status(404).json({ error: 'Ð¢Ð°Ð¹Ð»Ð°Ð½ Ð¾Ð»Ð´ÑÐ¾Ð½Ð³Ò¯Ð¹.' });
+    }
+    if (existing.rows[0].status !== 'rejected') {
+      return res.status(409).json({ error: 'Ð—Ó©Ð²Ñ…Ó©Ð½ Ñ‚Ð°Ñ‚Ð³Ð°Ð»Ð·ÑÐ°Ð½ Ñ‚Ð°Ð¹Ð»Ð°Ð½Ð³ Ð» Ð·Ð°ÑÐ°Ð¶ Ð±Ð¾Ð»Ð½Ð¾.' });
+    }
+
+    const result = await query(
+      `UPDATE form_submissions
+       SET title = $1, data = $2, status = 'pending',
+           rejection_reason = NULL, reviewed_by = NULL, reviewed_at = NULL,
+           updated_at = now()
+       WHERE id = $3
+       RETURNING id, company_id, department_id, submitted_by, title, data, status,
+                 rejection_reason, reviewed_by, reviewed_at, edit_unlocked, created_at, updated_at`,
+      [title, JSON.stringify(data), id]
+    );
+
+    await auditService.logEvent({
+      userId: req.auth.userId,
+      action: 'FORM_RESUBMITTED',
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'] || null,
+      metadata: { submissionId: id },
+    });
+
+    return res.status(200).json({ submission: result.rows[0] });
+  } catch (err) {
+    return next(err);
+  }
+}
+
+const reviewSchema = z.object({
+  action: z.enum(['accept', 'reject']),
+  rejection_reason: z.string().trim().max(1000).optional(),
+});
+
+async function review(req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!UUID_REGEX.test(id)) {
+      return res.status(400).json({ error: 'ID Ð±ÑƒÑ€ÑƒÑƒ Ð±Ð°Ð¹Ð½Ð°.' });
+    }
+
+    const { action, rejection_reason } = reviewSchema.parse(req.body);
+
+    const existing = await query(
+      `SELECT id, status FROM form_submissions WHERE id = $1 AND company_id = $2 AND deleted_at IS NULL`,
+      [id, req.auth.companyId]
+    );
+    if (existing.rows.length === 0) {
+      return res.status(404).json({ error: 'Ð¢Ð°Ð¹Ð»Ð°Ð½ Ð¾Ð»Ð´ÑÐ¾Ð½Ð³Ò¯Ð¹.' });
+    }
+    if (existing.rows[0].status !== 'pending') {
+      return res.status(409).json({ error: 'Ð­Ð½Ñ Ñ‚Ð°Ð¹Ð»Ð°Ð½ Ð°Ð»ÑŒ Ñ…ÑÐ´Ð¸Ð¹Ð½ ÑˆÐ¸Ð¹Ð´Ð²ÑÑ€Ð»ÑÐ³Ð´ÑÑÐ½ Ð±Ð°Ð¹Ð½Ð°.' });
+    }
+
+    const newStatus = action === 'accept' ? 'accepted' : 'rejected';
+
+    const result = await query(
+      `UPDATE form_submissions
+       SET status = $1, rejection_reason = $2, reviewed_by = $3, reviewed_at = now(), updated_at = now()
+       WHERE id = $4
+       RETURNING id, company_id, department_id, submitted_by, title, data, status,
+                 rejection_reason, reviewed_by, reviewed_at, edit_unlocked, created_at, updated_at`,
+      [newStatus, action === 'reject' ? rejection_reason || null : null, req.auth.userId, id]
+    );
+
+    await auditService.logEvent({
+      userId: req.auth.userId,
+      action: action === 'accept' ? 'FORM_ACCEPTED' : 'FORM_REJECTED',
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'] || null,
+      metadata: { submissionId: id, reason: rejection_reason || null },
+    });
+
+    return res.status(200).json({ submission: result.rows[0] });
+  } catch (err) {
+    return next(err);
+  }
+}
+
+const companyEditSchema = z.object({
+  title: z.string().trim().min(2).max(200),
+  data: dataFieldsSchema,
+});
+
+async function updateByCompany(req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!UUID_REGEX.test(id)) {
+      return res.status(400).json({ error: 'ID Ð±ÑƒÑ€ÑƒÑƒ Ð±Ð°Ð¹Ð½Ð°.' });
+    }
+
+    const { title, data } = companyEditSchema.parse(req.body);
+
+    const existing = await query(
+      `SELECT id, status, edit_unlocked FROM form_submissions WHERE id = $1 AND company_id = $2 AND deleted_at IS NULL`,
+      [id, req.auth.companyId]
+    );
+    if (existing.rows.length === 0) {
+      return res.status(404).json({ error: 'Ð¢Ð°Ð¹Ð»Ð°Ð½ Ð¾Ð»Ð´ÑÐ¾Ð½Ð³Ò¯Ð¹.' });
+    }
+
+    const row = existing.rows[0];
+    const canEdit = row.status !== 'accepted' || row.edit_unlocked;
+    if (!canEdit) {
+      return res.status(403).json({
+        error: 'Ð—Ó©Ð²ÑˆÓ©Ó©Ñ€ÑÓ©Ð½ Ñ‚Ð°Ð¹Ð»Ð°Ð½Ð³ Ð·Ð°ÑÐ°Ñ…Ñ‹Ð½ Ñ‚ÑƒÐ»Ð´ Super Admin-Ñ Ð·Ó©Ð²ÑˆÓ©Ó©Ñ€Ó©Ð» Ð°Ð²Ð°Ñ… ÑˆÐ°Ð°Ñ€Ð´Ð»Ð°Ð³Ð°Ñ‚Ð°Ð¹.',
+      });
+    }
+
+    const result = await query(
+      `UPDATE form_submissions
+       SET title = $1, data = $2, edit_unlocked = false, updated_at = now()
+       WHERE id = $3
+       RETURNING id, company_id, department_id, submitted_by, title, data, status,
+                 rejection_reason, reviewed_by, reviewed_at, edit_unlocked, created_at, updated_at`,
+      [title, JSON.stringify(data), id]
+    );
+
+    await auditService.logEvent({
+      userId: req.auth.userId,
+      action: 'FORM_EDITED_BY_COMPANY',
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'] || null,
+      metadata: { submissionId: id },
+    });
+
+    return res.status(200).json({ submission: result.rows[0] });
+  } catch (err) {
+    return next(err);
+  }
+}
+
+async function deleteByCompany(req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!UUID_REGEX.test(id)) {
+      return res.status(400).json({ error: 'ID Ð±ÑƒÑ€ÑƒÑƒ Ð±Ð°Ð¹Ð½Ð°.' });
+    }
+
+    const existing = await query(
+      `SELECT id, status, edit_unlocked FROM form_submissions WHERE id = $1 AND company_id = $2 AND deleted_at IS NULL`,
+      [id, req.auth.companyId]
+    );
+    if (existing.rows.length === 0) {
+      return res.status(404).json({ error: 'Ð¢Ð°Ð¹Ð»Ð°Ð½ Ð¾Ð»Ð´ÑÐ¾Ð½Ð³Ò¯Ð¹.' });
+    }
+
+    const row = existing.rows[0];
+    const canDelete = row.status !== 'accepted' || row.edit_unlocked;
+    if (!canDelete) {
+      return res.status(403).json({
+        error: 'Ð—Ó©Ð²ÑˆÓ©Ó©Ñ€ÑÓ©Ð½ Ñ‚Ð°Ð¹Ð»Ð°Ð½Ð³ ÑƒÑÑ‚Ð³Ð°Ñ…Ñ‹Ð½ Ñ‚ÑƒÐ»Ð´ Super Admin-Ñ Ð·Ó©Ð²ÑˆÓ©Ó©Ñ€Ó©Ð» Ð°Ð²Ð°Ñ… ÑˆÐ°Ð°Ñ€Ð´Ð»Ð°Ð³Ð°Ñ‚Ð°Ð¹.',
+      });
+    }
+
+    await query('UPDATE form_submissions SET deleted_at = now() WHERE id = $1', [id]);
+
+    await auditService.logEvent({
+      userId: req.auth.userId,
+      action: 'FORM_DELETED_BY_COMPANY',
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'] || null,
+      metadata: { submissionId: id },
+    });
+
+    return res.status(204).send();
+  } catch (err) {
+    return next(err);
+  }
+}
+
+const requestEditSchema = z.object({
+  reason: z.string().trim().min(2, 'Ð¨Ð°Ð»Ñ‚Ð³Ð°Ð°Ð½Ð°Ð° Ð±Ð¸Ñ‡Ð½Ñ Ò¯Ò¯.').max(1000),
+});
+
+async function requestEdit(req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!UUID_REGEX.test(id)) {
+      return res.status(400).json({ error: 'ID Ð±ÑƒÑ€ÑƒÑƒ Ð±Ð°Ð¹Ð½Ð°.' });
+    }
+
+    const { reason } = requestEditSchema.parse(req.body);
+
+    const existing = await query(
+      `SELECT id, status FROM form_submissions WHERE id = $1 AND company_id = $2 AND deleted_at IS NULL`,
+      [id, req.auth.companyId]
+    );
+    if (existing.rows.length === 0) {
+      return res.status(404).json({ error: 'Ð¢Ð°Ð¹Ð»Ð°Ð½ Ð¾Ð»Ð´ÑÐ¾Ð½Ð³Ò¯Ð¹.' });
+    }
+    if (existing.rows[0].status !== 'accepted') {
+      return res.status(409).json({ error: 'Ð—Ó©Ð²Ñ…Ó©Ð½ Ð·Ó©Ð²ÑˆÓ©Ó©Ñ€ÑÓ©Ð½ Ñ‚Ð°Ð¹Ð»Ð°Ð½Ð´ Ð» ÑÐ½Ñ Ñ…Ò¯ÑÑÐ»Ñ‚ Ñ…ÑÑ€ÑÐ³Ñ‚ÑÐ¹.' });
+    }
+
+    const dup = await query(
+      `SELECT id FROM submission_edit_requests WHERE submission_id = $1 AND status = 'pending'`,
+      [id]
+    );
+    if (dup.rows.length > 0) {
+      return res.status(409).json({ error: 'Ð­Ð½Ñ Ñ‚Ð°Ð¹Ð»Ð°Ð½Ð³Ð¸Ð¹Ð½ Ñ…Ò¯ÑÑÐ»Ñ‚ Ð°Ð»ÑŒ Ñ…ÑÐ´Ð¸Ð¹Ð½ Ð¸Ð»Ð³ÑÑÐ³Ð´ÑÑÐ½, Ñ…Ð°Ñ€Ð¸Ñƒ Ñ…Ò¯Ð»ÑÑÐ³Ð´ÑÐ¶ Ð±Ð°Ð¹Ð½Ð°.' });
+    }
+
+    const result = await query(
+      `INSERT INTO submission_edit_requests (submission_id, requested_by, reason)
+       VALUES ($1, $2, $3)
+       RETURNING id, submission_id, reason, status, created_at`,
+      [id, req.auth.userId, reason]
+    );
+
+    await auditService.logEvent({
+      userId: req.auth.userId,
+      action: 'EDIT_REQUEST_CREATED',
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'] || null,
+      metadata: { submissionId: id, requestId: result.rows[0].id },
+    });
+
+    return res.status(201).json({ request: result.rows[0] });
+  } catch (err) {
+    return next(err);
+  }
+}
+
+async function stats(req, res, next) {
+  try {
+    const { role, companyId } = req.auth;
+
+    let result;
+    if (role === 'super_admin') {
+      result = await query(
+        `SELECT c.id AS group_id, c.name AS group_name, COUNT(*)::int AS count
+         FROM form_submissions fs
+         JOIN companies c ON c.id = fs.company_id
+         WHERE fs.status = 'accepted' AND fs.deleted_at IS NULL
+         GROUP BY c.id, c.name
+         ORDER BY c.name`
+      );
+    } else {
+      result = await query(
+        `SELECT d.id AS group_id, d.name AS group_name, COUNT(*)::int AS count
+         FROM form_submissions fs
+         JOIN departments d ON d.id = fs.department_id
+         WHERE fs.company_id = $1 AND fs.status = 'accepted' AND fs.deleted_at IS NULL
+         GROUP BY d.id, d.name
+         ORDER BY d.name`,
+        [companyId]
+      );
+    }
+
+    return res.status(200).json({ stats: result.rows });
+  } catch (err) {
+    return next(err);
+  }
+}
+
+async function pendingCount(req, res, next) {
+  try {
+    const { role, companyId, departmentId } = req.auth;
+
+    let result;
+    if (role === 'company') {
+      result = await query(
+        `SELECT COUNT(*)::int AS count FROM form_submissions WHERE company_id = $1 AND status = 'pending' AND deleted_at IS NULL`,
+        [companyId]
+      );
+    } else if (role === 'department') {
+      result = await query(
+        `SELECT COUNT(*)::int AS count FROM form_submissions WHERE department_id = $1 AND status = 'rejected' AND deleted_at IS NULL`,
+        [departmentId]
+      );
+    } else {
+      return res.status(200).json({ count: 0 });
+    }
+
+    return res.status(200).json({ count: result.rows[0].count });
+  } catch (err) {
+    return next(err);
+  }
+}
+
+module.exports = {
+  create,
+  list,
+  resubmit,
+  review,
+  updateByCompany,
+  deleteByCompany,
+  requestEdit,
+  stats,
+  pendingCount,
+};
+
+===== src\controllers\notificationController.js =====
+
+"use strict";
+
+const { pool } = require("../config/db");
+const attachmentBlob = require("../services/notificationAttachmentBlobService");
+
+const MAX_ATTACHMENTS = 5;
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const MAX_SELECTED = 1000;
+
+/**
+ * ÐœÑÐ´ÑÐ³Ð´ÑÐ» Ñ…Ò¯Ð»ÑÑÐ½ Ð°Ð²Ð°Ñ… ÑÑ€Ñ…Ñ‚ÑÐ¹ Ñ…ÑÑ€ÑÐ³Ð»ÑÐ³Ñ‡Ð¸Ð´: Ð¸Ð´ÑÐ²Ñ…Ñ‚ÑÐ¹ ÐºÐ¾Ð¼Ð¿Ð°Ð½Ð¸Ð¹Ð½ CEO
+ * (role = 'company') Ð±Ð¾Ð»Ð¾Ð½ Ð¸Ð´ÑÐ²Ñ…Ñ‚ÑÐ¹ Ñ…ÑÐ»Ñ‚ÑÐ¸Ð¹Ð½ Ð°Ð´Ð¼Ð¸Ð½ (role = 'department').
+ * "Ð‘Ò¯Ð³Ð´ÑÐ´" Ð¸Ð»Ð³ÑÑÑ…ÑÐ´ ÑÐ³ ÑÐ½Ñ Ð¶Ð°Ð³ÑÐ°Ð°Ð»Ñ‚ Ð°ÑˆÐ¸Ð³Ð»Ð°Ð³Ð´Ð°Ð½Ð°.
+ */
+const ELIGIBLE_USERS_SQL = `
+  SELECT
+    u.id,
+    u.full_name,
+    u.email,
+    u.role,
+    u.company_id,
+    c.name AS company_name,
+    u.department_id,
+    d.name AS department_name
+  FROM users u
+  JOIN companies c ON c.id = u.company_id
+  LEFT JOIN departments d ON d.id = u.department_id
+  WHERE u.role IN ('company', 'department')
+    AND c.is_active = true
+    AND (u.role = 'company' OR d.is_active = true)
+`;
+
+/** ÐœÑÐ´ÑÐ³Ð´Ð»Ð¸Ð¹Ð½ Ñ…Ð°Ð²ÑÑ€Ð°Ð»Ñ‚Ñ‹Ð½ Ñ‚Ð¾Ð¾ (Ð¶Ð°Ð³ÑÐ°Ð°Ð»Ñ‚Ð°Ð´ ðŸ“Ž Ñ…Ð°Ñ€ÑƒÑƒÐ»Ð°Ñ…Ð°Ð´). */
+const ATTACHMENT_COUNT_SQL = `
+  (SELECT count(*)::int FROM notification_attachments a WHERE a.notification_id = n.id)
+`;
+
+/**
+ * Ð¥Ò¯ÑÑÐ»Ñ‚ÑÑÑ€ Ð¸Ñ€ÑÑÐ½ Ñ…Ð°Ð²ÑÑ€Ð°Ð»Ñ‚ÑƒÑƒÐ´Ñ‹Ð³ ÑˆÐ°Ð»Ð³Ð°Ð½Ð° â€” blob Ð±Ð¾Ð´Ð¸Ñ‚Ð¾Ð¾Ñ€ Ð±Ð°Ð¹Ð³Ð°Ð°, Ñ‚Ó©Ñ€Ó©Ð»,
+ * Ñ…ÑÐ¼Ð¶ÑÑ, ÑÑ…Ð½Ð¸Ð¹ Ð±Ð°Ð¹Ñ‚ Ð·Ó©Ð² ÑÑÑÑ…. Transaction ÑÑ…Ð»ÑÑ…ÑÑÑ Ó¨ÐœÐÓ¨ Ð´ÑƒÑƒÐ´Ð½Ð°.
+ * @returns {Promise<{ error: string } | { value: Array }>}
+ */
+async function validateAttachments(raw) {
+  if (raw === undefined || raw === null) return { value: [] };
+  if (!Array.isArray(raw)) return { error: "Ð¥Ð°Ð²ÑÑ€Ð°Ð»Ñ‚Ñ‹Ð½ Ñ„Ð¾Ñ€Ð¼Ð°Ñ‚ Ð±ÑƒÑ€ÑƒÑƒ Ð±Ð°Ð¹Ð½Ð°." };
+  if (raw.length > MAX_ATTACHMENTS) {
+    return { error: `Ð”ÑÑÐ´ Ñ‚Ð°Ð» Ð½ÑŒ ${MAX_ATTACHMENTS} Ñ„Ð°Ð¹Ð» Ñ…Ð°Ð²ÑÐ°Ñ€Ð³Ð°Ð½Ð°.` };
+  }
+
+  const seen = new Set();
+  const result = [];
+  for (const item of raw) {
+    const blobPath = item && item.blob_path;
+    const contentType = item && item.content_type;
+    const fileName =
+      item && typeof item.file_name === "string"
+        ? item.file_name.trim().slice(0, 200)
+        : "";
+
+    if (
+      !fileName ||
+      !attachmentBlob.isValidAttachmentBlobPath(blobPath, contentType) ||
+      seen.has(blobPath)
+    ) {
+      return { error: "Ð¥Ð°Ð²ÑÑ€Ð°Ð»Ñ‚Ñ‹Ð½ Ð¼ÑÐ´ÑÑÐ»ÑÐ» Ð±ÑƒÑ€ÑƒÑƒ Ð±Ð°Ð¹Ð½Ð°." };
+    }
+    seen.add(blobPath);
+
+    const check = await attachmentBlob.verifyAttachmentBlob(
+      blobPath,
+      contentType,
+    );
+    if (!check.ok) return { error: `"${fileName}": ${check.error}` };
+
+    result.push({ blobPath, contentType, fileName, size: check.size });
+  }
+  return { value: result };
+}
+
+// ---------- Super admin ----------
+
+/** Ð¥Ð°Ð²ÑÑ€Ð°Ð»Ñ‚ upload Ñ…Ð¸Ð¹Ñ… SAS URL. */
+async function getAttachmentUploadUrl(req, res, next) {
+  try {
+    const { contentType, fileSize } = req.body || {};
+    if (!attachmentBlob.isAllowedType(contentType)) {
+      return res.status(400).json({
+        error:
+          "Ð—Ó©Ð²Ñ…Ó©Ð½ Ð·ÑƒÑ€Ð°Ð³ (PNG, JPG, WEBP), PDF, Word, Excel, PowerPoint Ñ„Ð°Ð¹Ð» Ñ…Ð°Ð²ÑÐ°Ñ€Ð³Ð°Ð½Ð°.",
+      });
+    }
+    if (
+      typeof fileSize !== "number" ||
+      fileSize <= 0 ||
+      fileSize > attachmentBlob.MAX_ATTACHMENT_SIZE
+    ) {
+      return res
+        .status(400)
+        .json({ error: "Ð¤Ð°Ð¹Ð»Ñ‹Ð½ Ñ…ÑÐ¼Ð¶ÑÑ 10MB-Ñ Ð±Ð°Ð³Ð° Ð±Ð°Ð¹Ñ… Ñ‘ÑÑ‚Ð¾Ð¹." });
+    }
+    return res.json(attachmentBlob.generateAttachmentUploadUrl(contentType));
+  } catch (err) {
+    return next(err);
+  }
+}
+
+/** Ð¥Ò¯Ð»ÑÑÐ½ Ð°Ð²Ð°Ð³Ñ‡ ÑÐ¾Ð½Ð³Ð¾Ñ… Ð¶Ð°Ð³ÑÐ°Ð°Ð»Ñ‚ â€” ÐºÐ¾Ð¼Ð¿Ð°Ð½Ð¸Ð°Ñ€ ÑÑ€ÑÐ¼Ð±ÑÐ»ÑÑÐ½. */
+async function listRecipientOptions(req, res, next) {
+  try {
+    const result = await pool.query(
+      `SELECT * FROM (${ELIGIBLE_USERS_SQL}) e
+       ORDER BY e.company_name,
+                CASE e.role WHEN 'company' THEN 0 ELSE 1 END,
+                e.department_name NULLS FIRST,
+                e.full_name`,
+    );
+    return res.json({ recipients: result.rows });
+  } catch (err) {
+    return next(err);
+  }
+}
+
+async function create(req, res, next) {
+  const body = req.body || {};
+
+  const title = typeof body.title === "string" ? body.title.trim() : "";
+  const text = typeof body.body === "string" ? body.body.trim() : "";
+  const target = body.target;
+
+  if (title.length < 2 || title.length > 200) {
+    return res
+      .status(400)
+      .json({ error: "Ð“Ð°Ñ€Ñ‡Ð¸Ð³ 2-200 Ñ‚ÑÐ¼Ð´ÑÐ³Ñ‚Ñ‚ÑÐ¹ Ð±Ð°Ð¹Ñ… Ñ‘ÑÑ‚Ð¾Ð¹." });
+  }
+  if (text.length < 1 || text.length > 5000) {
+    return res
+      .status(400)
+      .json({ error: "ÐÐ³ÑƒÑƒÐ»Ð³Ð° 1-5000 Ñ‚ÑÐ¼Ð´ÑÐ³Ñ‚Ñ‚ÑÐ¹ Ð±Ð°Ð¹Ñ… Ñ‘ÑÑ‚Ð¾Ð¹." });
+  }
+  if (target !== "all" && target !== "selected") {
+    return res
+      .status(400)
+      .json({ error: "Ð¥Ò¯Ð»ÑÑÐ½ Ð°Ð²Ð°Ð³Ñ‡Ð¸Ð¹Ð½ Ñ‚Ó©Ñ€Ó©Ð» Ð±ÑƒÑ€ÑƒÑƒ Ð±Ð°Ð¹Ð½Ð°." });
+  }
+
+  let userIds = [];
+  if (target === "selected") {
+    if (!Array.isArray(body.user_ids) || body.user_ids.length === 0) {
+      return res
+        .status(400)
+        .json({ error: "Ð”Ð¾Ñ€ Ñ…Ð°ÑÐ¶ Ð½ÑÐ³ Ñ…Ò¯Ð»ÑÑÐ½ Ð°Ð²Ð°Ð³Ñ‡ ÑÐ¾Ð½Ð³Ð¾Ð½Ð¾ ÑƒÑƒ." });
+    }
+    userIds = [...new Set(body.user_ids)];
+    if (
+      userIds.length > MAX_SELECTED ||
+      !userIds.every((id) => typeof id === "string" && UUID_PATTERN.test(id))
+    ) {
+      return res
+        .status(400)
+        .json({ error: "Ð¥Ò¯Ð»ÑÑÐ½ Ð°Ð²Ð°Ð³Ñ‡Ð¸Ð¹Ð½ Ð¶Ð°Ð³ÑÐ°Ð°Ð»Ñ‚ Ð±ÑƒÑ€ÑƒÑƒ Ð±Ð°Ð¹Ð½Ð°." });
+    }
+  }
+
+  let attachments;
+  try {
+    const checked = await validateAttachments(body.attachments);
+    if (checked.error) return res.status(400).json({ error: checked.error });
+    attachments = checked.value;
+  } catch (err) {
+    return next(err);
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const inserted = await client.query(
+      `INSERT INTO notifications (title, body, target_type, created_by)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id, title, body, target_type, created_at`,
+      [title, text, target, req.auth.userId],
+    );
+    const notification = inserted.rows[0];
+
+    // Ð¡Ð¾Ð½Ð³Ð¾ÑÐ¾Ð½ ID-ÑƒÑƒÐ´ Ñ‡ Ð³ÑÑÑÐ½ ELIGIBLE Ð¶Ð°Ð³ÑÐ°Ð°Ð»Ñ‚Ð°Ð°Ñ€ ÑˆÒ¯Ò¯Ð³Ð´ÑÐ½Ñ â€” Ð¸Ð´ÑÐ²Ñ…Ð³Ò¯Ð¹
+    // ÐºÐ¾Ð¼Ð¿Ð°Ð½Ð¸, super_admin, ÑÑÐ²ÑÐ» Ð±Ð°Ð¹Ñ…Ð³Ò¯Ð¹ Ñ…ÑÑ€ÑÐ³Ð»ÑÐ³Ñ‡ Ñ€Ò¯Ò¯ Ð¸Ð»Ð³ÑÑÐ³Ð´ÑÑ…Ð³Ò¯Ð¹.
+    const recipients =
+      target === "all"
+        ? await client.query(
+            `INSERT INTO notification_recipients (notification_id, user_id)
+             SELECT $1, e.id FROM (${ELIGIBLE_USERS_SQL}) e`,
+            [notification.id],
+          )
+        : await client.query(
+            `INSERT INTO notification_recipients (notification_id, user_id)
+             SELECT $1, e.id FROM (${ELIGIBLE_USERS_SQL}) e
+             WHERE e.id = ANY($2)`,
+            [notification.id, userIds],
+          );
+
+    if (recipients.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res
+        .status(400)
+        .json({ error: "Ð˜Ð´ÑÐ²Ñ…Ñ‚ÑÐ¹ Ñ…Ò¯Ð»ÑÑÐ½ Ð°Ð²Ð°Ð³Ñ‡ Ð¾Ð»Ð´ÑÐ¾Ð½Ð³Ò¯Ð¹." });
+    }
+
+    for (let i = 0; i < attachments.length; i++) {
+      const a = attachments[i];
+      await client.query(
+        `INSERT INTO notification_attachments
+           (notification_id, blob_path, file_name, content_type, file_size_bytes, sort_order)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [notification.id, a.blobPath, a.fileName, a.contentType, a.size, i],
+      );
+    }
+
+    await client.query("COMMIT");
+
+    return res.status(201).json({
+      notification: {
+        ...notification,
+        recipient_count: recipients.rowCount,
+        read_count: 0,
+        attachment_count: attachments.length,
+      },
+    });
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    return next(err);
+  } finally {
+    client.release();
+  }
+}
+
+/** Ð˜Ð»Ð³ÑÑÑÑÐ½ Ð¼ÑÐ´ÑÐ³Ð´Ð»Ò¯Ò¯Ð´ + Ñ…ÑÐ´ÑÐ½ Ñ…Ò¯Ð½ ÑƒÐ½ÑˆÑÐ°Ð½ ÑÑ‚Ð°Ñ‚Ð¸ÑÑ‚Ð¸Ðº. */
+async function listSent(req, res, next) {
+  try {
+    const result = await pool.query(
+      `SELECT
+         n.id, n.title, n.body, n.target_type, n.created_at,
+         count(r.user_id)::int AS recipient_count,
+         count(r.read_at)::int AS read_count,
+         ${ATTACHMENT_COUNT_SQL} AS attachment_count
+       FROM notifications n
+       LEFT JOIN notification_recipients r ON r.notification_id = n.id
+       WHERE n.deleted_at IS NULL
+       GROUP BY n.id
+       ORDER BY n.created_at DESC
+       LIMIT 200`,
+    );
+    return res.json({ notifications: result.rows });
+  } catch (err) {
+    return next(err);
+  }
+}
+
+/** ÐÑÐ³ Ð¼ÑÐ´ÑÐ³Ð´Ð»Ð¸Ð¹Ð½ Ñ…Ò¯Ð»ÑÑÐ½ Ð°Ð²Ð°Ð³Ñ‡ Ð±Ò¯Ñ€Ð¸Ð¹Ð½ ÑƒÐ½ÑˆÑÐ°Ð½ ÑÑÑÑ…. */
+async function listRecipientStatus(req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!UUID_PATTERN.test(id))
+      return res.status(404).json({ error: "ÐœÑÐ´ÑÐ³Ð´ÑÐ» Ð¾Ð»Ð´ÑÐ¾Ð½Ð³Ò¯Ð¹." });
+
+    const exists = await pool.query(
+      `SELECT 1 FROM notifications WHERE id = $1 AND deleted_at IS NULL`,
+      [id],
+    );
+    if (exists.rowCount === 0)
+      return res.status(404).json({ error: "ÐœÑÐ´ÑÐ³Ð´ÑÐ» Ð¾Ð»Ð´ÑÐ¾Ð½Ð³Ò¯Ð¹." });
+
+    const result = await pool.query(
+      `SELECT
+         r.user_id, r.read_at,
+         u.full_name, u.email, u.role,
+         c.name AS company_name,
+         d.name AS department_name
+       FROM notification_recipients r
+       JOIN users u ON u.id = r.user_id
+       LEFT JOIN companies c ON c.id = u.company_id
+       LEFT JOIN departments d ON d.id = u.department_id
+       WHERE r.notification_id = $1
+       ORDER BY c.name,
+                CASE u.role WHEN 'company' THEN 0 ELSE 1 END,
+                d.name NULLS FIRST,
+                u.full_name`,
+      [id],
+    );
+    return res.json({ recipients: result.rows });
+  } catch (err) {
+    return next(err);
+  }
+}
+
+/** Soft delete â€” Ñ…Ò¯Ð»ÑÑÐ½ Ð°Ð²Ð°Ð³Ñ‡Ð´Ñ‹Ð½ inbox-Ð¾Ð¾Ñ Ð°Ð»Ð³Ð° Ð±Ð¾Ð»Ð½Ð¾. */
+async function remove(req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!UUID_PATTERN.test(id))
+      return res.status(404).json({ error: "ÐœÑÐ´ÑÐ³Ð´ÑÐ» Ð¾Ð»Ð´ÑÐ¾Ð½Ð³Ò¯Ð¹." });
+
+    const result = await pool.query(
+      `UPDATE notifications SET deleted_at = now()
+       WHERE id = $1 AND deleted_at IS NULL
+       RETURNING id`,
+      [id],
+    );
+    if (result.rowCount === 0)
+      return res.status(404).json({ error: "ÐœÑÐ´ÑÐ³Ð´ÑÐ» Ð¾Ð»Ð´ÑÐ¾Ð½Ð³Ò¯Ð¹." });
+    return res.status(204).end();
+  } catch (err) {
+    return next(err);
+  }
+}
+
+// ---------- CEO / department admin ----------
+
+async function listMine(req, res, next) {
+  try {
+    const result = await pool.query(
+      `SELECT n.id, n.title, n.body, n.created_at, r.read_at,
+              ${ATTACHMENT_COUNT_SQL} AS attachment_count
+       FROM notification_recipients r
+       JOIN notifications n ON n.id = r.notification_id
+       WHERE r.user_id = $1 AND n.deleted_at IS NULL
+       ORDER BY n.created_at DESC
+       LIMIT 100`,
+      [req.auth.userId],
+    );
+    return res.json({ notifications: result.rows });
+  } catch (err) {
+    return next(err);
+  }
+}
+
+async function unreadCount(req, res, next) {
+  try {
+    const result = await pool.query(
+      `SELECT count(*)::int AS count
+       FROM notification_recipients r
+       JOIN notifications n ON n.id = r.notification_id
+       WHERE r.user_id = $1 AND r.read_at IS NULL AND n.deleted_at IS NULL`,
+      [req.auth.userId],
+    );
+    return res.json({ count: result.rows[0].count });
+  } catch (err) {
+    return next(err);
+  }
+}
+
+async function markRead(req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!UUID_PATTERN.test(id))
+      return res.status(404).json({ error: "ÐœÑÐ´ÑÐ³Ð´ÑÐ» Ð¾Ð»Ð´ÑÐ¾Ð½Ð³Ò¯Ð¹." });
+
+    // ÐÐ»ÑŒ Ñ…ÑÐ´Ð¸Ð¹Ð½ ÑƒÐ½ÑˆÑÐ°Ð½ Ð±Ð¾Ð» read_at-Ð¸Ð¹Ð³ Ó©Ó©Ñ€Ñ‡Ð»Ó©Ñ…Ð³Ò¯Ð¹ (Ð°Ð½Ñ… ÑƒÐ½ÑˆÑÐ°Ð½ Ñ†Ð°Ð³ Ñ…Ð°Ð´Ð³Ð°Ð»Ð°Ð³Ð´Ð°Ð½Ð°).
+    const result = await pool.query(
+      `UPDATE notification_recipients r
+       SET read_at = COALESCE(r.read_at, now())
+       FROM notifications n
+       WHERE r.notification_id = $1
+         AND r.user_id = $2
+         AND n.id = r.notification_id
+         AND n.deleted_at IS NULL
+       RETURNING r.read_at`,
+      [id, req.auth.userId],
+    );
+    if (result.rowCount === 0)
+      return res.status(404).json({ error: "ÐœÑÐ´ÑÐ³Ð´ÑÐ» Ð¾Ð»Ð´ÑÐ¾Ð½Ð³Ò¯Ð¹." });
+    return res.json({ read_at: result.rows[0].read_at });
+  } catch (err) {
+    return next(err);
+  }
+}
+
+async function markAllRead(req, res, next) {
+  try {
+    const result = await pool.query(
+      `UPDATE notification_recipients r
+       SET read_at = now()
+       FROM notifications n
+       WHERE r.user_id = $1
+         AND r.read_at IS NULL
+         AND n.id = r.notification_id
+         AND n.deleted_at IS NULL`,
+      [req.auth.userId],
+    );
+    return res.json({ updated: result.rowCount });
+  } catch (err) {
+    return next(err);
+  }
+}
+
+// ---------- Ð¥Ð°Ð²ÑÑ€Ð°Ð»Ñ‚ (Ð±Ò¯Ñ… role) ----------
+
+/**
+ * ÐœÑÐ´ÑÐ³Ð´Ð»Ð¸Ð¹Ð½ Ñ…Ð°Ð²ÑÑ€Ð°Ð»Ñ‚ÑƒÑƒÐ´ + 15 Ð¼Ð¸Ð½ÑƒÑ‚Ñ‹Ð½ read link.
+ * super_admin â€” Ð±Ò¯Ñ… Ð¼ÑÐ´ÑÐ³Ð´ÑÐ»; Ð±ÑƒÑÐ°Ð´ â€” Ð·Ó©Ð²Ñ…Ó©Ð½ Ó©Ó©Ñ€Ñ‚ Ð¸Ñ€ÑÑÐ½ Ð¼ÑÐ´ÑÐ³Ð´ÑÐ».
+ */
+async function listAttachments(req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!UUID_PATTERN.test(id))
+      return res.status(404).json({ error: "ÐœÑÐ´ÑÐ³Ð´ÑÐ» Ð¾Ð»Ð´ÑÐ¾Ð½Ð³Ò¯Ð¹." });
+
+    const { role, userId } = req.auth;
+    const access =
+      role === "super_admin"
+        ? await pool.query(
+            `SELECT 1 FROM notifications WHERE id = $1 AND deleted_at IS NULL`,
+            [id],
+          )
+        : await pool.query(
+            `SELECT 1 FROM notification_recipients r
+             JOIN notifications n ON n.id = r.notification_id
+             WHERE r.notification_id = $1 AND r.user_id = $2 AND n.deleted_at IS NULL`,
+            [id, userId],
+          );
+    if (access.rowCount === 0)
+      return res.status(404).json({ error: "ÐœÑÐ´ÑÐ³Ð´ÑÐ» Ð¾Ð»Ð´ÑÐ¾Ð½Ð³Ò¯Ð¹." });
+
+    const result = await pool.query(
+      `SELECT id, blob_path, file_name, content_type, file_size_bytes
+       FROM notification_attachments
+       WHERE notification_id = $1
+       ORDER BY sort_order, created_at`,
+      [id],
+    );
+
+    const attachments = result.rows.map((a) => ({
+      id: a.id,
+      file_name: a.file_name,
+      content_type: a.content_type,
+      file_size_bytes: a.file_size_bytes,
+      url: attachmentBlob.generateAttachmentReadUrl(
+        a.blob_path,
+        a.file_name,
+        a.content_type,
+      ),
+    }));
+
+    return res.json({ attachments });
+  } catch (err) {
+    return next(err);
+  }
+}
+
+module.exports = {
+  getAttachmentUploadUrl,
+  listAttachments,
+  listRecipientOptions,
+  create,
+  listSent,
+  listRecipientStatus,
+  remove,
+  listMine,
+  unreadCount,
+  markRead,
+  markAllRead,
+};
+
+
+===== src\controllers\systemGuideController.js =====
+
+"use strict";
+
+const { pool } = require("../config/db");
+const guideBlob = require("../services/guideBlobService");
+
+const AUDIENCES = ["company", "department"];
+const MAX_GUIDE_SIZE = 20 * 1024 * 1024;
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// blob_path-Ð¸Ð¹Ð³ client Ñ€ÑƒÑƒ Ñ…ÑÐ·ÑÑ Ñ‡ Ð±ÑƒÑ†Ð°Ð°Ñ…Ð³Ò¯Ð¹ â€” Ð·Ó©Ð²Ñ…Ó©Ð½ view-url-Ð°Ð°Ñ€ Ð´Ð°Ð¼Ð¶Ð¸Ð½Ð°.
+const PUBLIC_COLUMNS = `
+  id, title, description, file_size_bytes, audience, is_active,
+  sort_order, version, created_at, updated_at
+`;
+
+// ---------- validation helpers ----------
+
+function validateTitle(value) {
+  if (typeof value !== "string") return "Ð“Ð°Ñ€Ñ‡Ð¸Ð³ ÑˆÐ°Ð°Ñ€Ð´Ð»Ð°Ð³Ð°Ñ‚Ð°Ð¹.";
+  const t = value.trim();
+  if (t.length < 2 || t.length > 200)
+    return "Ð“Ð°Ñ€Ñ‡Ð¸Ð³ 2-200 Ñ‚ÑÐ¼Ð´ÑÐ³Ñ‚Ñ‚ÑÐ¹ Ð±Ð°Ð¹Ñ… Ñ‘ÑÑ‚Ð¾Ð¹.";
+  return null;
+}
+
+function normalizeDescription(value) {
+  if (value === null || value === undefined) return { value: null };
+  if (typeof value !== "string")
+    return { error: "Ð¢Ð°Ð¹Ð»Ð±Ð°Ñ€Ñ‹Ð½ Ñ„Ð¾Ñ€Ð¼Ð°Ñ‚ Ð±ÑƒÑ€ÑƒÑƒ Ð±Ð°Ð¹Ð½Ð°." };
+  const d = value.trim();
+  if (d.length > 1000)
+    return { error: "Ð¢Ð°Ð¹Ð»Ð±Ð°Ñ€ 1000 Ñ‚ÑÐ¼Ð´ÑÐ³Ñ‚ÑÑÑ Ñ…ÑÑ‚Ñ€ÑÑ…Ð³Ò¯Ð¹ Ð±Ð°Ð¹Ñ… Ñ‘ÑÑ‚Ð¾Ð¹." };
+  return { value: d.length > 0 ? d : null };
+}
+
+function normalizeAudience(value) {
+  if (!Array.isArray(value) || value.length === 0) {
+    return { error: "Ð¥ÑÐ½Ð´ Ñ…Ð°Ñ€Ð°Ð³Ð´Ð°Ñ…Ñ‹Ð³ Ð´Ð¾Ñ€ Ñ…Ð°ÑÐ¶ Ð½ÑÐ³Ð¸Ð¹Ð³ ÑÐ¾Ð½Ð³Ð¾Ð½Ð¾ ÑƒÑƒ." };
+  }
+  const unique = [...new Set(value)];
+  if (!unique.every((a) => AUDIENCES.includes(a))) {
+    return { error: "Ð¥ÑÐ½Ð´ Ñ…Ð°Ñ€Ð°Ð³Ð´Ð°Ñ… ÑƒÑ‚Ð³Ð° Ð±ÑƒÑ€ÑƒÑƒ Ð±Ð°Ð¹Ð½Ð°." };
+  }
+  return { value: unique };
+}
+
+/** Upload Ñ…Ð¸Ð¹Ð³Ð´ÑÑÐ½ blob Ð±Ð¾Ð´Ð¸Ñ‚Ð¾Ð¾Ñ€ Ð±Ð°Ð¹Ð³Ð°Ð°, PDF, Ñ…ÑÐ¼Ð¶ÑÑ Ð·Ó©Ð² ÑÑÑÑ…Ð¸Ð¹Ð³ ÑˆÐ°Ð»Ð³Ð°Ð½Ð°. */
+async function verifyUploadedBlob(blobPath) {
+  if (!guideBlob.isValidGuideBlobPath(blobPath)) {
+    return { error: "Ð¤Ð°Ð¹Ð»Ñ‹Ð½ Ð·Ð°Ð¼ Ð±ÑƒÑ€ÑƒÑƒ Ð±Ð°Ð¹Ð½Ð°." };
+  }
+  const info = await guideBlob.inspectGuideBlob(blobPath);
+  if (!info.exists) {
+    return { error: "Ð¤Ð°Ð¹Ð» Ð±Ð°Ð¹Ñ€ÑˆÑƒÑƒÐ»Ð°Ð³Ð´Ð°Ð°Ð³Ò¯Ð¹ Ð±Ð°Ð¹Ð½Ð°. Ð”Ð°Ñ…Ð¸Ð½ Ð¾Ñ€Ð¾Ð»Ð´Ð¾Ð½Ð¾ ÑƒÑƒ." };
+  }
+  if (!info.isPdf || info.size > MAX_GUIDE_SIZE || info.size === 0) {
+    await guideBlob.deleteGuideBlob(blobPath);
+    return {
+      error: info.isPdf
+        ? "Ð¤Ð°Ð¹Ð»Ñ‹Ð½ Ñ…ÑÐ¼Ð¶ÑÑ 20MB-Ñ Ñ…ÑÑ‚ÑÑ€ÑÑÐ½ Ð±Ð°Ð¹Ð½Ð°."
+        : "Ð¤Ð°Ð¹Ð» PDF Ð±Ð¸Ñˆ Ð±Ð°Ð¹Ð½Ð°.",
+    };
+  }
+  return { size: info.size };
+}
+
+// ---------- handlers ----------
+
+async function list(req, res, next) {
+  try {
+    const { role } = req.auth;
+
+    let result;
+    if (role === "super_admin") {
+      result = await pool.query(
+        `SELECT ${PUBLIC_COLUMNS} FROM system_guides
+         WHERE deleted_at IS NULL
+         ORDER BY sort_order, created_at`,
+      );
+    } else if (AUDIENCES.includes(role)) {
+      result = await pool.query(
+        `SELECT ${PUBLIC_COLUMNS} FROM system_guides
+         WHERE deleted_at IS NULL AND is_active = true AND $1 = ANY(audience)
+         ORDER BY sort_order, created_at`,
+        [role],
+      );
+    } else {
+      return res.status(403).json({ error: "Ð¥Ð°Ð½Ð´Ð°Ñ… ÑÑ€Ñ…Ð³Ò¯Ð¹." });
+    }
+
+    return res.json({ guides: result.rows });
+  } catch (err) {
+    return next(err);
+  }
+}
+
+async function getUploadUrl(req, res, next) {
+  try {
+    const { fileName, fileSize } = req.body || {};
+    if (typeof fileName !== "string" || fileName.length === 0) {
+      return res.status(400).json({ error: "Ð¤Ð°Ð¹Ð»Ñ‹Ð½ Ð½ÑÑ€ ÑˆÐ°Ð°Ñ€Ð´Ð»Ð°Ð³Ð°Ñ‚Ð°Ð¹." });
+    }
+    if (
+      typeof fileSize !== "number" ||
+      fileSize <= 0 ||
+      fileSize > MAX_GUIDE_SIZE
+    ) {
+      return res
+        .status(400)
+        .json({ error: "Ð¤Ð°Ð¹Ð»Ñ‹Ð½ Ñ…ÑÐ¼Ð¶ÑÑ 20MB-Ñ Ð±Ð°Ð³Ð° Ð±Ð°Ð¹Ñ… Ñ‘ÑÑ‚Ð¾Ð¹." });
+    }
+    return res.json(guideBlob.generateGuideUploadUrl(fileName));
+  } catch (err) {
+    return next(err);
+  }
+}
+
+async function create(req, res, next) {
+  try {
+    const body = req.body || {};
+
+    const titleError = validateTitle(body.title);
+    if (titleError) return res.status(400).json({ error: titleError });
+
+    const description = normalizeDescription(body.description);
+    if (description.error)
+      return res.status(400).json({ error: description.error });
+
+    const audience = normalizeAudience(body.audience);
+    if (audience.error) return res.status(400).json({ error: audience.error });
+
+    const sortOrder =
+      Number.isInteger(body.sort_order) && body.sort_order >= 0
+        ? body.sort_order
+        : 0;
+
+    const blob = await verifyUploadedBlob(body.blob_path);
+    if (blob.error) return res.status(400).json({ error: blob.error });
+
+    const result = await pool.query(
+      `INSERT INTO system_guides
+         (title, description, blob_path, file_size_bytes, audience, sort_order, created_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING ${PUBLIC_COLUMNS}`,
+      [
+        body.title.trim(),
+        description.value,
+        body.blob_path,
+        blob.size,
+        audience.value,
+        sortOrder,
+        req.auth.userId,
+      ],
+    );
+
+    return res.status(201).json({ guide: result.rows[0] });
+  } catch (err) {
+    return next(err);
+  }
+}
+
+async function update(req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!UUID_PATTERN.test(id))
+      return res.status(404).json({ error: "Ð—Ð°Ð°Ð²Ð°Ñ€ Ð¾Ð»Ð´ÑÐ¾Ð½Ð³Ò¯Ð¹." });
+
+    const existing = await pool.query(
+      `SELECT id, blob_path FROM system_guides WHERE id = $1 AND deleted_at IS NULL`,
+      [id],
+    );
+    if (existing.rowCount === 0)
+      return res.status(404).json({ error: "Ð—Ð°Ð°Ð²Ð°Ñ€ Ð¾Ð»Ð´ÑÐ¾Ð½Ð³Ò¯Ð¹." });
+    const oldBlobPath = existing.rows[0].blob_path;
+
+    const body = req.body || {};
+    const sets = [];
+    const values = [];
+    let contentChanged = false; // updated_at-Ð¸Ð¹Ð³ Ð·Ó©Ð²Ñ…Ó©Ð½ Ð°Ð³ÑƒÑƒÐ»Ð³Ð° Ó©Ó©Ñ€Ñ‡Ð»Ó©Ð³Ð´Ó©Ñ…Ó©Ð´ ÑˆÐ¸Ð½ÑÑ‡Ð¸Ð»Ð½Ñ
+    let newBlobPath = null;
+
+    function addSet(column, value) {
+      values.push(value);
+      sets.push(`${column} = $${values.length}`);
+    }
+
+    if (body.title !== undefined) {
+      const titleError = validateTitle(body.title);
+      if (titleError) return res.status(400).json({ error: titleError });
+      addSet("title", body.title.trim());
+      contentChanged = true;
+    }
+
+    if (body.description !== undefined) {
+      const description = normalizeDescription(body.description);
+      if (description.error)
+        return res.status(400).json({ error: description.error });
+      addSet("description", description.value);
+      contentChanged = true;
+    }
+
+    if (body.audience !== undefined) {
+      const audience = normalizeAudience(body.audience);
+      if (audience.error)
+        return res.status(400).json({ error: audience.error });
+      addSet("audience", audience.value);
+    }
+
+    if (body.is_active !== undefined) {
+      if (typeof body.is_active !== "boolean") {
+        return res.status(400).json({ error: "Ð¢Ó©Ð»Ó©Ð²Ð¸Ð¹Ð½ Ñ„Ð¾Ñ€Ð¼Ð°Ñ‚ Ð±ÑƒÑ€ÑƒÑƒ Ð±Ð°Ð¹Ð½Ð°." });
+      }
+      addSet("is_active", body.is_active);
+    }
+
+    if (body.sort_order !== undefined) {
+      if (!Number.isInteger(body.sort_order) || body.sort_order < 0) {
+        return res.status(400).json({ error: "Ð”Ð°Ñ€Ð°Ð°Ð»Ð»Ñ‹Ð½ ÑƒÑ‚Ð³Ð° Ð±ÑƒÑ€ÑƒÑƒ Ð±Ð°Ð¹Ð½Ð°." });
+      }
+      addSet("sort_order", body.sort_order);
+    }
+
+    if (body.blob_path !== undefined && body.blob_path !== oldBlobPath) {
+      const blob = await verifyUploadedBlob(body.blob_path);
+      if (blob.error) return res.status(400).json({ error: blob.error });
+      addSet("blob_path", body.blob_path);
+      addSet("file_size_bytes", blob.size);
+      sets.push("version = version + 1");
+      newBlobPath = body.blob_path;
+      contentChanged = true;
+    }
+
+    if (sets.length === 0) {
+      return res.status(400).json({ error: "Ó¨Ó©Ñ€Ñ‡Ð»Ó©Ñ… Ñ‚Ð°Ð»Ð±Ð°Ñ€ Ð°Ð»Ð³Ð°." });
+    }
+    if (contentChanged) sets.push("updated_at = now()");
+
+    values.push(id);
+    const result = await pool.query(
+      `UPDATE system_guides SET ${sets.join(", ")}
+       WHERE id = $${values.length} AND deleted_at IS NULL
+       RETURNING ${PUBLIC_COLUMNS}`,
+      values,
+    );
+    if (result.rowCount === 0)
+      return res.status(404).json({ error: "Ð—Ð°Ð°Ð²Ð°Ñ€ Ð¾Ð»Ð´ÑÐ¾Ð½Ð³Ò¯Ð¹." });
+
+    // Ð¤Ð°Ð¹Ð» ÑÐ¾Ð»Ð¸Ð³Ð´ÑÐ¾Ð½ Ð±Ð¾Ð» Ñ…ÑƒÑƒÑ‡Ð¸Ð½ blob-Ð¸Ð¹Ð³ Ñ†ÑÐ²ÑÑ€Ð»ÑÐ½Ñ (storage-Ð´ Ó©Ð½Ñ‡Ð¸Ð½ Ñ„Ð°Ð¹Ð» Ò¯Ð»Ð´ÑÑÑ…Ð³Ò¯Ð¹).
+    if (newBlobPath) {
+      await guideBlob.deleteGuideBlob(oldBlobPath);
+    }
+
+    return res.json({ guide: result.rows[0] });
+  } catch (err) {
+    return next(err);
+  }
+}
+
+async function remove(req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!UUID_PATTERN.test(id))
+      return res.status(404).json({ error: "Ð—Ð°Ð°Ð²Ð°Ñ€ Ð¾Ð»Ð´ÑÐ¾Ð½Ð³Ò¯Ð¹." });
+
+    // Soft delete â€” blob-Ð¸Ð¹Ð³ Ò¯Ð»Ð´ÑÑÐ½Ñ, ÑˆÐ°Ð°Ñ€Ð´Ð»Ð°Ð³Ð°Ñ‚Ð°Ð¹ Ð±Ð¾Ð» DB-ÑÑÑ ÑÑÑ€Ð³ÑÑÐ¶ Ð±Ð¾Ð»Ð½Ð¾.
+    const result = await pool.query(
+      `UPDATE system_guides SET deleted_at = now()
+       WHERE id = $1 AND deleted_at IS NULL
+       RETURNING id`,
+      [id],
+    );
+    if (result.rowCount === 0)
+      return res.status(404).json({ error: "Ð—Ð°Ð°Ð²Ð°Ñ€ Ð¾Ð»Ð´ÑÐ¾Ð½Ð³Ò¯Ð¹." });
+
+    return res.status(204).end();
+  } catch (err) {
+    return next(err);
+  }
+}
+
+async function getViewUrl(req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!UUID_PATTERN.test(id))
+      return res.status(404).json({ error: "Ð—Ð°Ð°Ð²Ð°Ñ€ Ð¾Ð»Ð´ÑÐ¾Ð½Ð³Ò¯Ð¹." });
+
+    const result = await pool.query(
+      `SELECT title, blob_path, audience, is_active FROM system_guides
+       WHERE id = $1 AND deleted_at IS NULL`,
+      [id],
+    );
+    if (result.rowCount === 0)
+      return res.status(404).json({ error: "Ð—Ð°Ð°Ð²Ð°Ñ€ Ð¾Ð»Ð´ÑÐ¾Ð½Ð³Ò¯Ð¹." });
+
+    const guide = result.rows[0];
+    const { role } = req.auth;
+
+    // Ð­Ñ€Ñ…Ð³Ò¯Ð¹ Ð±Ð¾Ð» Ð±Ð°Ð¹Ð³Ð°Ð° ÑÑÑÑ…Ð¸Ð¹Ð³ Ñ‡ Ð¸Ð»Ñ‡Ð»ÑÑ…Ð³Ò¯Ð¹Ð½ Ñ‚ÑƒÐ»Ð´ 404 Ð±ÑƒÑ†Ð°Ð°Ð½Ð°.
+    if (role !== "super_admin") {
+      if (
+        !AUDIENCES.includes(role) ||
+        !guide.is_active ||
+        !guide.audience.includes(role)
+      ) {
+        return res.status(404).json({ error: "Ð—Ð°Ð°Ð²Ð°Ñ€ Ð¾Ð»Ð´ÑÐ¾Ð½Ð³Ò¯Ð¹." });
+      }
+    }
+
+    return res.json({
+      url: guideBlob.generateGuideReadUrl(guide.blob_path, guide.title),
+    });
+  } catch (err) {
+    return next(err);
+  }
+}
+
+module.exports = { list, getUploadUrl, create, update, remove, getViewUrl };
+
+
+===== src\middleware\authenticate.js =====
+
+'use strict';
+
+const jwt = require('jsonwebtoken');
+const { verifyAccessToken } = require('../utils/jwt');
+
+/**
+ * Authorization: Bearer <token> header-ÑÑÑ access token-Ð¸Ð¹Ð³ ÑƒÐ½ÑˆÐ¸Ñ…,
+ * ÑˆÐ°Ð»Ð³Ð°Ð°Ð´ req.auth = { userId, role, companyId, departmentId } Ð³ÑÐ¶
+ * Ñ‚Ð°Ð²Ð¸Ð½Ð°.
+ *
+ * Ð§Ð£Ð¥ÐÐ›: req.auth.companyId/departmentId Ð½ÑŒ Ð—Ó¨Ð’Ð¥Ó¨Ð ÑÐ½Ñ token-Ñ
+ * Ð³Ð°Ñ€Ð´Ð°Ð³ â€” client-Ñ request body/query-ÑÑÑ€ Ð¸Ñ€ÑÑÐ½ company_id-Ð³
+ * Ð¥Ð­Ð—Ð­Ð­ Ð§ Ð¸Ñ‚Ð³ÑÐ¶ Ð°ÑˆÐ¸Ð³Ð»Ð°Ñ…Ð³Ò¯Ð¹. Ð”Ð°Ñ€Ð°Ð°Ð³Ð¸Ð¹Ð½ ÑˆÐ°Ñ‚Ð°Ð½Ð´ (RLS Ñ…Ð¾Ð»Ð±Ð¾Ñ… middleware)
+ * ÑÐ³ ÑÐ½Ñ req.auth-Ð¸Ð¹Ð³ Ð°ÑˆÐ¸Ð³Ð»Ð°Ð½ DB session variable Ñ‚Ð¾Ñ…Ð¸Ñ€ÑƒÑƒÐ»Ð½Ð°.
+ */
+function authenticate(req, res, next) {
+  const header = req.headers.authorization || '';
+  const [scheme, token] = header.split(' ');
+
+  if (scheme !== 'Bearer' || !token) {
+    return res.status(401).json({ error: 'ÐÑÐ²Ñ‚Ñ€ÑÑ… ÑˆÐ°Ð°Ñ€Ð´Ð»Ð°Ð³Ð°Ñ‚Ð°Ð¹.' });
+  }
+
+  try {
+    const payload = verifyAccessToken(token);
+    req.auth = {
+      userId: payload.sub,
+      role: payload.role,
+      companyId: payload.companyId,
+      departmentId: payload.departmentId,
+    };
+    return next();
+  } catch (err) {
+    if (err instanceof jwt.TokenExpiredError) {
+      return res.status(401).json({ error: 'Token Ñ…ÑƒÐ³Ð°Ñ†Ð°Ð° Ð´ÑƒÑƒÑÑÐ°Ð½.', code: 'TOKEN_EXPIRED' });
+    }
+    return res.status(401).json({ error: 'Token Ñ…Ò¯Ñ‡Ð¸Ð½Ð³Ò¯Ð¹ Ð±Ð°Ð¹Ð½Ð°.' });
+  }
+}
+
+/**
+ * Ð¢Ð¾Ð´Ð¾Ñ€Ñ…Ð¾Ð¹ role(ÑƒÑƒÐ´)-Ð´ Ð» Ð·Ó©Ð²ÑˆÓ©Ó©Ñ€Ó©Ð³Ð´ÑÓ©Ð½ route Ñ…Ð¸Ð¹Ñ…ÑÐ´ Ð°ÑˆÐ¸Ð³Ð»Ð°Ð½Ð°.
+ * Ð–Ð¸ÑˆÑÑ: router.get('/admin/x', authenticate, authorize('super_admin'), handler)
+ */
+function authorize(...allowedRoles) {
+  return (req, res, next) => {
+    if (!req.auth) {
+      return res.status(401).json({ error: 'ÐÑÐ²Ñ‚Ñ€ÑÑ… ÑˆÐ°Ð°Ñ€Ð´Ð»Ð°Ð³Ð°Ñ‚Ð°Ð¹.' });
+    }
+    if (!allowedRoles.includes(req.auth.role)) {
+      return res.status(403).json({ error: 'Ð­Ð½Ñ Ò¯Ð¹Ð»Ð´ÑÐ»Ð´ Ñ‚Ð°Ð½Ñ‹ ÑÑ€Ñ… Ñ…Ò¯Ñ€ÑÐ»Ñ†ÑÑ…Ð³Ò¯Ð¹ Ð±Ð°Ð¹Ð½Ð°.' });
+    }
+    return next();
+  };
+}
+
+module.exports = { authenticate, authorize };
+
+
+===== src\middleware\errorHandler.js =====
+
+'use strict';
+
+const logger = require('../utils/logger');
+const { AuthError } = require('../services/authService');
+
+// eslint-disable-next-line no-unused-vars
+function errorHandler(err, req, res, next) {
+  if (err instanceof AuthError) {
+    return res.status(err.statusCode).json({ error: err.message });
+  }
+
+  if (err.name === 'ZodError') {
+    return res.status(400).json({
+      error: 'ÐžÑ€ÑƒÑƒÐ»ÑÐ°Ð½ Ð´Ð°Ñ‚Ð° Ð±ÑƒÑ€ÑƒÑƒ Ð±Ð°Ð¹Ð½Ð°.',
+      details: err.issues.map((i) => ({ path: i.path.join('.'), message: i.message })),
+    });
+  }
+
+  logger.error('Unhandled error', { message: err.message, stack: err.stack });
+  return res.status(500).json({ error: 'Ð¡ÐµÑ€Ð²ÐµÑ€Ð¸Ð¹Ð½ Ð´Ð¾Ñ‚Ð¾Ð¾Ð´ Ð°Ð»Ð´Ð°Ð° Ð³Ð°Ñ€Ð»Ð°Ð°.' });
+}
+
+module.exports = errorHandler;
+
+
+===== src\middleware\rateLimiters.js =====
+
+'use strict';
+
+const rateLimit = require('express-rate-limit');
+
+/**
+ * IP-Ñ…Ð°ÑÐ³Ð°Ð°Ñ€ Ñ…ÑÐ·Ð³Ð°Ð°Ñ€Ð»Ð°Ð½Ð° â€” ÑÐ½Ñ Ð½ÑŒ account lockout-Ñ‹Ð½ ÐÐ­ÐœÐ­Ð›Ð¢ Ð´Ð°Ð²Ñ…Ð°Ñ€Ð³Ð°.
+ * Account lockout Ð½ÑÐ³ user-Ð¸Ð¹Ð³ Ñ…Ð°Ð¼Ð³Ð°Ð°Ð»Ð´Ð°Ð³ Ð±Ð¾Ð» ÑÐ½Ñ Ð½ÑŒ Ð½ÑÐ³ IP-Ñ Ð¾Ð»Ð¾Ð½
+ * Ó©Ó©Ñ€ email Ð¾Ñ€Ð¾Ð»Ð´Ð¾Ñ… (credential stuffing) Ñ…ÑÐ»Ð±ÑÑ€Ð¸Ð¹Ð½ Ñ…Ð°Ð»Ð´Ð»Ð°Ð³Ð°Ð°Ñ Ñ…Ð°Ð¼Ð³Ð°Ð°Ð»Ð½Ð°.
+ */
+const loginRateLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 Ð¼Ð¸Ð½ÑƒÑ‚
+  max: 20, // 15 Ð¼Ð¸Ð½ÑƒÑ‚Ð°Ð½Ð´ Ð½ÑÐ³ IP-Ñ Ð´ÑÑÐ´ Ñ‚Ð°Ð» Ð½ÑŒ 20 Ð¾Ñ€Ð¾Ð»Ð´Ð»Ð¾Ð³Ð¾
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Ð¥ÑÑ‚ Ð¾Ð»Ð¾Ð½ ÑƒÐ´Ð°Ð° Ð¾Ñ€Ð¾Ð»Ð´Ð»Ð¾Ð¾. Ð¢Ò¯Ñ€ Ñ…Ò¯Ð»ÑÑÐ³ÑÑÐ´ Ð´Ð°Ñ…Ð¸Ð½ Ð¾Ñ€Ð¾Ð»Ð´Ð¾Ð½Ð¾ ÑƒÑƒ.' },
+});
+
+const refreshRateLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Ð¥ÑÑ‚ Ð¾Ð»Ð¾Ð½ ÑƒÐ´Ð°Ð° Ð¾Ñ€Ð¾Ð»Ð´Ð»Ð¾Ð¾. Ð¢Ò¯Ñ€ Ñ…Ò¯Ð»ÑÑÐ³ÑÑÐ´ Ð´Ð°Ñ…Ð¸Ð½ Ð¾Ñ€Ð¾Ð»Ð´Ð¾Ð½Ð¾ ÑƒÑƒ.' },
+});
+
+module.exports = { loginRateLimiter, refreshRateLimiter };
+
+
+===== src\routes\adminRoutes.js =====
+
+'use strict';
+
+const express = require('express');
+const { authenticate, authorize } = require('../middleware/authenticate');
+
+const router = express.Router();
+
+// Ð—Ó©Ð²Ñ…Ó©Ð½ super_admin ÑÑ€Ñ…Ñ‚ÑÐ¹ Ñ…ÑÑ€ÑÐ³Ð»ÑÐ³Ñ‡ Ð½ÑÐ²Ñ‚ÑÑ€Ñ‡ Ñ‡Ð°Ð´Ð°Ñ… ÑÑÑÑ…Ð¸Ð¹Ð³ ÑˆÐ°Ð»Ð³Ð°Ñ…
+// Ð·Ð¾Ñ€Ð¸ÑƒÐ»Ð°Ð»Ñ‚Ñ‚Ð°Ð¹ ÑÐ½Ð³Ð¸Ð¹Ð½ endpoint. Ð”Ð°Ñ€Ð°Ð°Ð³Ð¸Ð¹Ð½ ÑˆÐ°Ñ‚Ð°Ð½Ð´ ÐºÐ¾Ð¼Ð¿Ð°Ð½Ð¸/department
+// ÑƒÐ´Ð¸Ñ€Ð´Ð°Ñ… Ð±Ð¾Ð´Ð¸Ñ‚ endpoint-ÑƒÑƒÐ´ ÑÐ½Ñ router Ð´Ð¾Ñ‚Ð¾Ñ€ Ð½ÑÐ¼ÑÐ³Ð´ÑÐ½Ñ.
+router.get('/ping', authenticate, authorize('super_admin'), (req, res) => {
+  res.json({ ok: true, message: 'super_admin ÑÑ€Ñ…ÑÑÑ€ Ð°Ð¼Ð¶Ð¸Ð»Ñ‚Ñ‚Ð°Ð¹ Ñ…Ð°Ð½Ð´Ð»Ð°Ð°.', auth: req.auth });
+});
+
+module.exports = router;
+
+
+===== src\routes\analyticsRoutes.js =====
+
+'use strict';
+
+const express = require('express');
+const controller = require('../controllers/analyticsController');
+const { authenticate, authorize } = require('../middleware/authenticate');
+
+const router = express.Router();
+router.get('/', authenticate, authorize('company', 'super_admin'), controller.analytics);
+
+module.exports = router;
+
+===== src\routes\authRoutes.js =====
+
+'use strict';
+
+const express = require('express');
+const authController = require('../controllers/authController');
+const { authenticate } = require('../middleware/authenticate');
+const { loginRateLimiter, refreshRateLimiter } = require('../middleware/rateLimiters');
+
+const router = express.Router();
+
+router.post('/login', loginRateLimiter, authController.login);
+router.post('/refresh', refreshRateLimiter, authController.refresh);
+router.post('/logout', authenticate, authController.logout);
+router.get('/me', authenticate, authController.me);
+
+module.exports = router;
+
+
+===== src\routes\companyRoutes.js =====
+
+'use strict';
+
+const express = require('express');
+const companyController = require('../controllers/companyController');
+const { authenticate, authorize } = require('../middleware/authenticate');
+
+const router = express.Router();
+
+router.get('/', authenticate, authorize('super_admin'), companyController.list);
+router.post('/', authenticate, authorize('super_admin'), companyController.create);
+router.post('/logo-upload-url', authenticate, authorize('super_admin'), companyController.getLogoUploadUrl);
+router.patch('/:id', authenticate, authorize('super_admin'), companyController.update);
+router.delete('/:id', authenticate, authorize('super_admin'), companyController.remove);
+
+module.exports = router;
+
+===== src\routes\departmentRoutes.js =====
+
+'use strict';
+
+const express = require('express');
+const controller = require('../controllers/departmentController');
+const { authenticate, authorize } = require('../middleware/authenticate');
+
+const router = express.Router();
+
+router.get('/', authenticate, authorize('company'), controller.list);
+router.get('/all', authenticate, authorize('super_admin'), controller.listAll);
+router.get('/mine', authenticate, authorize('department'), controller.mine);
+router.post('/', authenticate, authorize('company'), controller.create);
+router.delete('/:id', authenticate, authorize('company'), controller.remove);
+
+module.exports = router;
+
+===== src\routes\departmentTemplateRoutes.js =====
+
+'use strict';
+
+const express = require('express');
+const controller = require('../controllers/departmentTemplateController');
+const { authenticate, authorize } = require('../middleware/authenticate');
+
+const router = express.Router();
+
+router.get('/', authenticate, authorize('super_admin', 'company', 'department'), controller.list);
+router.post('/', authenticate, authorize('super_admin'), controller.create);
+router.patch('/:id', authenticate, authorize('super_admin'), controller.update);
+router.delete('/:id', authenticate, authorize('super_admin'), controller.remove);
+
+module.exports = router;
+
+===== src\routes\editRequestRoutes.js =====
+
+'use strict';
+
+const express = require('express');
+const controller = require('../controllers/editRequestController');
+const { authenticate, authorize } = require('../middleware/authenticate');
+
+const router = express.Router();
+
+router.get('/', authenticate, authorize('super_admin'), controller.list);
+router.patch('/:id/review', authenticate, authorize('super_admin'), controller.review);
+
+module.exports = router;
+
+===== src\routes\formSubmissionRoutes.js =====
+
+'use strict';
+
+const express = require('express');
+const controller = require('../controllers/formSubmissionController');
+const { authenticate, authorize } = require('../middleware/authenticate');
+
+const router = express.Router();
+
+router.get('/', authenticate, authorize('company', 'department', 'super_admin'), controller.list);
+router.get('/stats', authenticate, authorize('company', 'super_admin'), controller.stats);
+router.get('/pending-count', authenticate, authorize('company', 'department'), controller.pendingCount);
+router.post('/', authenticate, authorize('department'), controller.create);
+router.patch('/:id', authenticate, authorize('department'), controller.resubmit);
+router.patch('/:id/review', authenticate, authorize('company'), controller.review);
+router.patch('/:id/edit', authenticate, authorize('company'), controller.updateByCompany);
+router.delete('/:id', authenticate, authorize('company'), controller.deleteByCompany);
+router.post('/:id/request-edit', authenticate, authorize('company'), controller.requestEdit);
+
+module.exports = router;
+
+===== src\routes\notificationRoutes.js =====
+
+'use strict';
+
+const express = require('express');
+const notificationController = require('../controllers/notificationController');
+const { authenticate, authorize } = require('../middleware/authenticate');
+
+const router = express.Router();
+
+const admin = [authenticate, authorize('super_admin')];
+const receiver = [authenticate, authorize('company', 'department')];
+const anyRole = [authenticate, authorize('super_admin', 'company', 'department')];
+
+// ÐÐÐ¥ÐÐÐ : Ñ‚Ð¾Ð³Ñ‚Ð¼Ð¾Ð» Ð·Ð°Ð¼ÑƒÑƒÐ´ (/unread-count, /sent ...) Ð·Ð°Ð°Ð²Ð°Ð» /:id-ÑÑÑ Ó¨ÐœÐÓ¨ Ð±Ð°Ð¹Ð½Ð°.
+
+// CEO / department admin â€” Ó©Ó©Ñ€Ð¸Ð¹Ð½ inbox
+router.get('/', ...receiver, notificationController.listMine);
+router.get('/unread-count', ...receiver, notificationController.unreadCount);
+router.post('/read-all', ...receiver, notificationController.markAllRead);
+router.post('/:id/read', ...receiver, notificationController.markRead);
+
+// Super admin â€” Ð¸Ð»Ð³ÑÑÑ…, Ñ…ÑÐ½Ð°Ñ…
+router.post('/attachments/upload-url', ...admin, notificationController.getAttachmentUploadUrl);
+router.get('/recipients', ...admin, notificationController.listRecipientOptions);
+router.get('/sent', ...admin, notificationController.listSent);
+router.post('/', ...admin, notificationController.create);
+router.get('/:id/recipients', ...admin, notificationController.listRecipientStatus);
+router.delete('/:id', ...admin, notificationController.remove);
+
+// Ð¥Ð°Ð²ÑÑ€Ð°Ð»Ñ‚ â€” controller Ð´Ð¾Ñ‚Ð¾Ñ€ ÑÑ€Ñ… (Ñ…Ò¯Ð»ÑÑÐ½ Ð°Ð²Ð°Ð³Ñ‡ ÑÑÑÑ…) ÑˆÐ°Ð»Ð³Ð°Ð½Ð°
+router.get('/:id/attachments', ...anyRole, notificationController.listAttachments);
+
+module.exports = router;
+
+===== src\routes\systemGuideRoutes.js =====
+
+'use strict';
+
+const express = require('express');
+const systemGuideController = require('../controllers/systemGuideController');
+const { authenticate, authorize } = require('../middleware/authenticate');
+
+const router = express.Router();
+
+// Ð‘Ò¯Ñ… Ð½ÑÐ²Ñ‚ÑÑ€ÑÑÐ½ Ñ…ÑÑ€ÑÐ³Ð»ÑÐ³Ñ‡ â€” controller Ð´Ð¾Ñ‚Ð¾Ñ€ role-Ð¾Ð¾Ñ€ ÑˆÒ¯Ò¯Ð½Ñ.
+router.get('/', authenticate, systemGuideController.list);
+router.get('/:id/view-url', authenticate, systemGuideController.getViewUrl);
+
+// Ð—Ó©Ð²Ñ…Ó©Ð½ super_admin
+router.post('/upload-url', authenticate, authorize('super_admin'), systemGuideController.getUploadUrl);
+router.post('/', authenticate, authorize('super_admin'), systemGuideController.create);
+router.patch('/:id', authenticate, authorize('super_admin'), systemGuideController.update);
+router.delete('/:id', authenticate, authorize('super_admin'), systemGuideController.remove);
+
+module.exports = router;
+
+===== src\scripts\run-migrations.js =====
+
+'use strict';
+
+/**
+ * Ð­Ð½Ð³Ð¸Ð¹Ð½ migration runner. ÐžÐ´Ð¾Ð¾Ñ…Ð¾Ð½Ð´Ð¾Ð¾ migration Ñ†Ó©Ó©Ñ…Ó©Ð½ Ð±Ð°Ð¹Ð³Ð°Ð° Ñ‚ÑƒÐ»
+ * Ð·Ð¾Ñ€Ð¸Ð»Ð³Ð¾ Ð½ÑŒ "ÑÐ¼Ð°Ñ€ Ñ‡ ÑÐ°Ð½ Ð´ÑÑÑ€ migration Ñ„Ð°Ð¹Ð»ÑƒÑƒÐ´Ñ‹Ð³ Ð´Ð°Ñ€Ð°Ð°Ð»Ð»Ð°Ð°Ñ€
+ * Ð°Ð¶Ð¸Ð»Ð»ÑƒÑƒÐ»Ð°Ñ…" Ð³ÑÑÑÐ½ Ñ…Ð°Ð¼Ð³Ð¸Ð¹Ð½ ÑÐ³ÑÐ½ Ð·Ð°Ñ€Ñ‡Ð¸Ð¼ â€” Ñ‚Ð¾Ð¼ Ð±Ð¾Ð»Ð¾Ñ…Ð¾Ð´
+ * node-pg-migrate ÑÑÐ²ÑÐ» Prisma Migrate Ñ€ÑƒÑƒ ÑˆÐ¸Ð»Ð¶Ð¸Ð¶ Ð±Ð¾Ð»Ð½Ð¾.
+ */
+
+const fs = require('fs');
+const path = require('path');
+const { pool } = require('../config/db');
+const logger = require('../utils/logger');
+
+const MIGRATIONS_DIR = path.join(__dirname, '..', 'migrations');
+
+async function ensureMigrationsTable(client) {
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS _migrations (
+      filename TEXT PRIMARY KEY,
+      applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `);
+}
+
+async function getAppliedMigrations(client) {
+  const { rows } = await client.query('SELECT filename FROM _migrations');
+  return new Set(rows.map((r) => r.filename));
+}
+
+async function run() {
+  const client = await pool.connect();
+  try {
+    await ensureMigrationsTable(client);
+    const applied = await getAppliedMigrations(client);
+
+    const files = fs
+      .readdirSync(MIGRATIONS_DIR)
+      .filter((f) => f.endsWith('.sql'))
+      .sort();
+
+    for (const file of files) {
+      if (applied.has(file)) {
+        logger.info(`Skip (Ð°Ð»ÑŒ Ñ…ÑÐ´Ð¸Ð¹Ð½ Ð°Ð¶Ð¸Ð»Ð»Ð°ÑÐ°Ð½): ${file}`);
+        continue;
+      }
+
+      const sql = fs.readFileSync(path.join(MIGRATIONS_DIR, file), 'utf8');
+      logger.info(`ÐÐ¶Ð¸Ð»Ð»ÑƒÑƒÐ»Ð¶ Ð±Ð°Ð¹Ð½Ð°: ${file}`);
+
+      await client.query('BEGIN');
+      try {
+        await client.query(sql);
+        await client.query('INSERT INTO _migrations (filename) VALUES ($1)', [file]);
+        await client.query('COMMIT');
+        logger.info(`ÐÐ¼Ð¶Ð¸Ð»Ñ‚Ñ‚Ð°Ð¹: ${file}`);
+      } catch (err) {
+        await client.query('ROLLBACK');
+        throw new Error(`Migration ${file} Ð±Ò¯Ñ‚ÑÐ»Ð³Ò¯Ð¹Ñ‚Ð»ÑÑ: ${err.message}`);
+      }
+    }
+
+    logger.info('Ð‘Ò¯Ñ… migration ÑˆÐ¸Ð½ÑÑ‡Ð»ÑÐ³Ð´Ð»ÑÑ.');
+  } finally {
+    client.release();
+    await pool.end();
+  }
+}
+
+run().catch((err) => {
+  logger.error('Migration runner Ð°Ð»Ð´Ð°Ð°Ñ‚Ð°Ð¹ Ð·Ð¾Ð³ÑÐ»Ð¾Ð¾', { message: err.message });
+  process.exit(1);
+});
+
+
+===== src\scripts\seed-super-admin.js =====
+
+'use strict';
+
+/**
+ * ÐÐ½Ñ…Ð½Ñ‹ super_admin Ñ…ÑÑ€ÑÐ³Ð»ÑÐ³Ñ‡Ð¸Ð¹Ð³ Ò¯Ò¯ÑÐ³ÑÐ½Ñ. Ð£Ñ‚Ð³ÑƒÑƒÐ´Ñ‹Ð³ .env-Ñ (SUPER_ADMIN_EMAIL,
+ * SUPER_ADMIN_PASSWORD, SUPER_ADMIN_FULL_NAME) ÑƒÐ½ÑˆÐ¸Ð½Ð° â€” ÐºÐ¾Ð´ Ð´Ð¾Ñ‚Ð¾Ñ€ Ð½ÑƒÑƒÑ† Ò¯Ð³
+ * ÑˆÑƒÑƒÐ´ Ð±Ð¸Ñ‡Ð¸Ñ…Ð³Ò¯Ð¹.
+ *
+ * ÐÐ¶Ð¸Ð»Ð»ÑƒÑƒÐ»Ð°Ñ…: npm run seed:super-admin
+ *
+ * ÐÑŽÑƒÐ»Ð³Ò¯Ð¹ Ð±Ð°Ð¹Ð´Ð»Ñ‹Ð½ Ð°Ð½Ñ…Ð°Ð°Ñ€Ð°Ñ… Ð·Ò¯Ð¹Ð»: ÑÐ½Ñ script-Ð¸Ð¹Ð³ production Ð´ÑÑÑ€ Ð—Ó¨Ð’Ð¥Ó¨Ð
+ * ÐÐ­Ð“ Ð£Ð”ÐÐ Ð°Ð¶Ð¸Ð»Ð»ÑƒÑƒÐ»Ð½Ð°. ÐÐ¶Ð¸Ð»Ð»Ð°ÑÐ½Ñ‹ Ð´Ð°Ñ€Ð°Ð° .env Ñ„Ð°Ð¹Ð»Ð°Ð°Ñ SUPER_ADMIN_PASSWORD-Ð³
+ * ÑƒÑÑ‚Ð³Ð°Ñ…Ñ‹Ð³ Ð·Ó©Ð²Ð»Ó©Ð¶ Ð±Ð°Ð¹Ð½Ð° â€” ÑƒÑ‡Ð¸Ñ€ Ð½ÑŒ ÑÐ½Ñ Ñ„Ð°Ð¹Ð» Ð´Ð¾Ñ‚Ð¾Ñ€ Ð½ÑƒÑƒÑ† Ò¯Ð³ plaintext
+ * Ñ…ÑÐ»Ð±ÑÑ€ÑÑÑ€ Ð±Ð°Ð¹Ñ… ÑˆÐ°Ð°Ñ€Ð´Ð»Ð°Ð³Ð°Ð³Ò¯Ð¹ Ð±Ð¾Ð»Ð½Ð¾ (DB-Ð´ Ð·Ó©Ð²Ñ…Ó©Ð½ hash Ð½ÑŒ Ò¯Ð»Ð´ÑÐ½Ñ).
+ */
+
+const { pool } = require('../config/db');
+const { hashPassword } = require('../services/authService');
+const env = require('../config/env');
+const logger = require('../utils/logger');
+
+async function seed() {
+  const { superAdminEmail, superAdminPassword, superAdminFullName } = env.seed;
+
+  if (!superAdminEmail || !superAdminPassword) {
+    throw new Error(
+      'SUPER_ADMIN_EMAIL Ð±Ð¾Ð»Ð¾Ð½ SUPER_ADMIN_PASSWORD .env Ñ„Ð°Ð¹Ð»Ð´ Ð·Ð°Ð°Ð²Ð°Ð» Ð±Ð°Ð¹Ñ… Ñ‘ÑÑ‚Ð¾Ð¹.'
+    );
+  }
+
+  if (superAdminPassword.length < 12) {
+    throw new Error(
+      'SUPER_ADMIN_PASSWORD Ñ…ÑÑ‚ Ð±Ð¾Ð³Ð¸Ð½Ð¾ Ð±Ð°Ð¹Ð½Ð° (Ð´Ð¾Ð¾Ð´ Ñ‚Ð°Ð» Ð½ÑŒ 12 Ñ‚ÑÐ¼Ð´ÑÐ³Ñ‚). Ð˜Ð»Ò¯Ò¯ ÑƒÑ€Ñ‚, ÑÐ°Ð½Ð°Ð¼ÑÐ°Ñ€Ð³Ò¯Ð¹ Ð½ÑƒÑƒÑ† Ò¯Ð³ Ð°ÑˆÐ¸Ð³Ð»Ð°Ð½Ð° ÑƒÑƒ.'
+    );
+  }
+
+  const existing = await pool.query('SELECT id FROM users WHERE lower(email) = lower($1)', [
+    superAdminEmail,
+  ]);
+
+  if (existing.rows.length > 0) {
+    logger.info(`super_admin Ñ…ÑÑ€ÑÐ³Ð»ÑÐ³Ñ‡ Ð°Ð»ÑŒ Ñ…ÑÐ´Ð¸Ð¹Ð½ Ð±Ð°Ð¹Ð½Ð°, Ð°Ð»Ð³Ð°ÑÐ°Ð¶ Ð±Ð°Ð¹Ð½Ð°: ${superAdminEmail}`);
+    return;
+  }
+
+  const passwordHash = await hashPassword(superAdminPassword);
+
+  await pool.query(
+    `INSERT INTO users (email, password_hash, full_name, role, company_id, department_id, is_active)
+     VALUES ($1, $2, $3, 'super_admin', NULL, NULL, true)`,
+    [superAdminEmail, passwordHash, superAdminFullName]
+  );
+
+  logger.info(`super_admin Ñ…ÑÑ€ÑÐ³Ð»ÑÐ³Ñ‡ Ð°Ð¼Ð¶Ð¸Ð»Ñ‚Ñ‚Ð°Ð¹ Ò¯Ò¯ÑÐ»ÑÑ: ${superAdminEmail}`);
+}
+
+seed()
+  .catch((err) => {
+    logger.error('Seed script Ð°Ð»Ð´Ð°Ð°Ñ‚Ð°Ð¹ Ð·Ð¾Ð³ÑÐ»Ð¾Ð¾', { message: err.message });
+    process.exitCode = 1;
+  })
+  .finally(() => pool.end());
+
+
+===== src\services\auditService.js =====
+
+'use strict';
+
+const { query } = require('../config/db');
+
+/**
+ * Audit event Ð±Ð¸Ñ‡Ð¸Ñ… Ñ†Ð¾Ñ€Ñ‹Ð½ Ð³Ð°Ð½Ñ† Ñ†ÑÐ³. Login Ð°Ð¼Ð¶Ð¸Ð»Ñ‚Ñ‚Ð°Ð¹/Ð°Ð¼Ð¶Ð¸Ð»Ñ‚Ð³Ò¯Ð¹, logout,
+ * token refresh, account lock Ð·ÑÑ€ÑÐ³ authentication-Ñ‚ÑÐ¹ Ñ…Ð¾Ð»Ð±Ð¾Ð¾Ñ‚Ð¾Ð¹ Ð±Ò¯Ñ…
+ * Ò¯Ð¹Ð»Ð´ÑÐ» Ð­ÐÐ­ Ñ„ÑƒÐ½ÐºÑ†ÑÑÑ€ Ð´Ð°Ð¼Ð¶Ð¸Ð½Ð° â€” Ð¸Ð½Ð³ÑÑÐ½ÑÑÑ€ audit trail-Ð´ Ñ†Ð¾Ð¾Ñ€Ñ…Ð¾Ð¹
+ * Ð³Ð°Ñ€Ð°Ñ…Ð³Ò¯Ð¹.
+ *
+ * @param {object} params
+ * @param {string|null} params.userId
+ * @param {string} params.action
+ * @param {string|null} params.ipAddress
+ * @param {string|null} params.userAgent
+ * @param {object} [params.metadata]
+ */
+async function logEvent({ userId = null, action, ipAddress = null, userAgent = null, metadata = {} }) {
+  await query(
+    `INSERT INTO audit_log (user_id, action, ip_address, user_agent, metadata)
+     VALUES ($1, $2, $3, $4, $5)`,
+    [userId, action, ipAddress, userAgent, JSON.stringify(metadata)]
+  );
+}
+
+module.exports = { logEvent };
+
+
+===== src\services\authService.js =====
+
+'use strict';
+
+const bcrypt = require('bcrypt');
+const { query, withTransaction } = require('../config/db');
+const { signAccessToken, generateRefreshToken, hashRefreshToken } = require('../utils/jwt');
+const auditService = require('./auditService');
+const env = require('../config/env');
+
+const BCRYPT_ROUNDS = 12;
+
+class AuthError extends Error {
+  constructor(message, statusCode = 401) {
+    super(message);
+    this.name = 'AuthError';
+    this.statusCode = statusCode;
+  }
+}
+
+function sanitizeUser(user) {
+  // password_hash-Ð¸Ð¹Ð³ client Ñ€Ò¯Ò¯ Ñ…ÑÐ·ÑÑ Ñ‡ Ð±ÑƒÑ†Ð°Ð°Ñ…Ð³Ò¯Ð¹
+  const { password_hash, ...safe } = user;
+  return safe;
+}
+
+async function findUserByEmail(email) {
+  const result = await query(
+    `SELECT id, email, password_hash, full_name, role, company_id, department_id,
+            is_active, failed_login_attempts, locked_until
+     FROM users
+     WHERE lower(email) = lower($1)
+       AND deleted_at IS NULL`,
+    [email]
+  );
+  return result.rows[0] || null;
+}
+
+async function hashPassword(plainPassword) {
+  return bcrypt.hash(plainPassword, BCRYPT_ROUNDS);
+}
+
+/**
+ * ÐÑÐ²Ñ‚Ñ€ÑÑ… Ò¯Ð½Ð´ÑÑÐ½ Ð»Ð¾Ð³Ð¸Ðº.
+ *
+ * ÐÑŽÑƒÐ»Ð³Ò¯Ð¹ Ð±Ð°Ð¹Ð´Ð»Ñ‹Ð½ Ð°Ð½Ñ…Ð°Ð°Ñ€Ð°Ñ… Ð·Ò¯Ð¹Ð»Ñ:
+ * - Ð¥ÑÑ€ÑÐ³Ð»ÑÐ³Ñ‡ Ð¾Ð»Ð´Ð¾Ð¾Ð³Ò¯Ð¹ Ð±Ð° Ð½ÑƒÑƒÑ† Ò¯Ð³ Ð±ÑƒÑ€ÑƒÑƒ Ñ…Ð¾Ñ‘Ñ€Ñ‚ Ð¯Ð“ Ð˜Ð–Ð˜Ð› generic Ð°Ð»Ð´Ð°Ð°
+ *   Ð±ÑƒÑ†Ð°Ð°Ð½Ð° (Ð°Ð»ÑŒ Ð½ÑŒ Ð±ÑƒÑ€ÑƒÑƒ Ð±Ð¾Ð»Ð¾Ñ…Ñ‹Ð³ Ð¸Ð»Ñ€Ò¯Ò¯Ð»ÑÑ… Ð±Ð¾Ð»Ð¾Ð¼Ð¶Ð³Ò¯Ð¹ Ð±Ð¾Ð»Ð³Ð¾Ñ… â€” user
+ *   enumeration Ñ…Ð°Ð»Ð´Ð»Ð°Ð³Ð°Ð°Ñ ÑÑÑ€Ð³Ð¸Ð¹Ð»Ð½Ñ).
+ * - N ÑƒÐ´Ð°Ð° Ð±ÑƒÑ€ÑƒÑƒ Ð¾Ñ€Ð¾Ð»Ð´Ð²Ð¾Ð» account-Ð¸Ð¹Ð³ Ñ‚Ò¯Ñ€ Ñ…ÑƒÐ³Ð°Ñ†Ð°Ð°Ð³Ð°Ð°Ñ€ Ñ‚Ò¯Ð³Ð¶Ð¸Ð½Ñ
+ *   (account lockout) â€” brute-force-Ð¾Ð¾Ñ ÑÑÑ€Ð³Ð¸Ð¹Ð»Ð½Ñ. Ð­Ð½Ñ Ð½ÑŒ IP-based
+ *   rate limit-Ð¸Ð¹Ð½ Ð½ÑÐ¼ÑÐ»Ñ‚ Ð´Ð°Ð²Ñ…Ð°Ñ€Ð³Ð° (route Ð´ÑÑÑ€ Ñ‚Ð¾Ñ…Ð¸Ñ€ÑƒÑƒÐ»ÑÐ°Ð½).
+ * - ÐÐ¼Ð¶Ð¸Ð»Ñ‚Ñ‚Ð°Ð¹/Ð°Ð¼Ð¶Ð¸Ð»Ñ‚Ð³Ò¯Ð¹ Ð¾Ñ€Ð¾Ð»Ð´Ð»Ð¾Ð³Ð¾ Ð±Ò¯Ñ€Ð¸Ð¹Ð³ audit_log-Ð´ Ð±Ð¸Ñ‡Ð½Ñ.
+ */
+async function login({ email, password, ipAddress, userAgent }) {
+  const user = await findUserByEmail(email);
+
+  const genericError = () => new AuthError('Ð˜Ð¼ÑÐ¹Ð» ÑÑÐ²ÑÐ» Ð½ÑƒÑƒÑ† Ò¯Ð³ Ð±ÑƒÑ€ÑƒÑƒ Ð±Ð°Ð¹Ð½Ð°.', 401);
+
+  if (!user) {
+    await auditService.logEvent({
+      action: 'LOGIN_FAILED',
+      ipAddress,
+      userAgent,
+      metadata: { reason: 'user_not_found', email },
+    });
+    throw genericError();
+  }
+
+  if (!user.is_active) {
+    await auditService.logEvent({
+      userId: user.id,
+      action: 'LOGIN_FAILED',
+      ipAddress,
+      userAgent,
+      metadata: { reason: 'account_inactive' },
+    });
+    throw genericError();
+  }
+
+  if (user.locked_until && new Date(user.locked_until) > new Date()) {
+    await auditService.logEvent({
+      userId: user.id,
+      action: 'LOGIN_FAILED',
+      ipAddress,
+      userAgent,
+      metadata: { reason: 'account_locked', locked_until: user.locked_until },
+    });
+    throw new AuthError(
+      `Ð”Ð°Ð½Ñ Ñ‚Ò¯Ñ€ Ñ…ÑƒÐ³Ð°Ñ†Ð°Ð°Ð³Ð°Ð°Ñ€ Ñ‚Ò¯Ð³Ð¶Ð¸Ð³Ð´ÑÑÐ½ Ð±Ð°Ð¹Ð½Ð°. ${new Date(user.locked_until).toLocaleString('mn-MN')} Ñ…Ò¯Ñ€Ñ‚ÑÐ» Ð´Ð°Ñ…Ð¸Ð½ Ð¾Ñ€Ð¾Ð»Ð´Ð¾Ð¶ Ð±Ð¾Ð»Ð¾Ñ…Ð³Ò¯Ð¹.`,
+      423
+    );
+  }
+
+  const passwordMatches = await bcrypt.compare(password, user.password_hash);
+
+  if (!passwordMatches) {
+    await handleFailedAttempt(user, ipAddress, userAgent);
+    throw genericError();
+  }
+
+  // ÐÐ¼Ð¶Ð¸Ð»Ñ‚Ñ‚Ð°Ð¹ â€” failed_login_attempts-Ð¸Ð¹Ð³ Ñ‚ÑÐ³Ð»ÑÐ¶, last_login Ð¼ÑÐ´ÑÑÐ»Ð»Ð¸Ð¹Ð³ ÑˆÐ¸Ð½ÑÑ‡Ð¸Ð»Ð½Ñ
+  await query(
+    `UPDATE users
+     SET failed_login_attempts = 0,
+         locked_until = NULL,
+         last_login_at = now(),
+         last_login_ip = $2,
+         updated_at = now()
+     WHERE id = $1`,
+    [user.id, ipAddress]
+  );
+
+  await auditService.logEvent({
+    userId: user.id,
+    action: 'LOGIN_SUCCESS',
+    ipAddress,
+    userAgent,
+  });
+
+  const accessToken = signAccessToken(user);
+  const { raw: refreshTokenRaw, hash: refreshTokenHash } = generateRefreshToken();
+
+  const expiresAt = new Date();
+  expiresAt.setDate(expiresAt.getDate() + env.jwt.refreshTokenTtlDays);
+
+  await query(
+    `INSERT INTO refresh_tokens (user_id, token_hash, expires_at, user_agent, ip_address)
+     VALUES ($1, $2, $3, $4, $5)`,
+    [user.id, refreshTokenHash, expiresAt, userAgent, ipAddress]
+  );
+
+  return {
+    accessToken,
+    refreshToken: refreshTokenRaw,
+    refreshTokenExpiresAt: expiresAt,
+    user: sanitizeUser(user),
+  };
+}
+
+/**
+ * Ð‘ÑƒÑ€ÑƒÑƒ Ð½ÑƒÑƒÑ† Ò¯Ð³ Ð¾Ñ€ÑƒÑƒÐ»Ð°Ñ… Ð±Ò¯Ñ€Ð¸Ð¹Ð³ Ñ‚Ð¾Ð¾Ð»Ð¶, Ñ‚Ð¾Ð³Ñ‚Ð¾Ð¾ÑÐ¾Ð½ Ñ‚Ð¾Ð¾Ð½Ð¾Ð¾Ñ Ð´Ð°Ð²Ð±Ð°Ð»
+ * account-Ð¸Ð¹Ð³ lockout-Ñ‹Ð½ Ñ…ÑƒÐ³Ð°Ñ†Ð°Ð°Ð³Ð°Ð°Ñ€ Ñ‚Ò¯Ð³Ð¶Ð¸Ð½Ñ. Ð¢Ð¾Ð¾Ð»Ð¾Ð» + Ñ‚Ò¯Ð³Ð¶Ð¸Ð»Ñ‚Ð¸Ð¹Ð³
+ * Ð½ÑÐ³ transaction Ð´Ð¾Ñ‚Ð¾Ñ€ Ñ…Ð¸Ð¹Ð¶, race condition-Ð¾Ð¾Ñ ÑÑÑ€Ð³Ð¸Ð¹Ð»Ð½Ñ.
+ */
+async function handleFailedAttempt(user, ipAddress, userAgent) {
+  await withTransaction(async (client) => {
+    const { rows } = await client.query(
+      `UPDATE users
+       SET failed_login_attempts = failed_login_attempts + 1,
+           updated_at = now()
+       WHERE id = $1
+       RETURNING failed_login_attempts`,
+      [user.id]
+    );
+
+    const attempts = rows[0].failed_login_attempts;
+    const shouldLock = attempts >= env.security.maxFailedLoginAttempts;
+
+    if (shouldLock) {
+      const lockedUntil = new Date();
+      lockedUntil.setMinutes(lockedUntil.getMinutes() + env.security.lockoutMinutes);
+
+      await client.query(`UPDATE users SET locked_until = $2 WHERE id = $1`, [user.id, lockedUntil]);
+
+      await client.query(
+        `INSERT INTO audit_log (user_id, action, ip_address, user_agent, metadata)
+         VALUES ($1, 'ACCOUNT_LOCKED', $2, $3, $4)`,
+        [user.id, ipAddress, userAgent, JSON.stringify({ attempts, locked_until: lockedUntil })]
+      );
+    } else {
+      await client.query(
+        `INSERT INTO audit_log (user_id, action, ip_address, user_agent, metadata)
+         VALUES ($1, 'LOGIN_FAILED', $2, $3, $4)`,
+        [user.id, ipAddress, userAgent, JSON.stringify({ reason: 'wrong_password', attempts })]
+      );
+    }
+  });
+}
+
+/**
+ * Refresh token Ð°ÑˆÐ¸Ð³Ð»Ð°Ð½ ÑˆÐ¸Ð½Ñ access token Ð°Ð²Ð°Ñ…. Refresh token
+ * Ð°ÑˆÐ¸Ð³Ð»Ð°Ð³Ð´Ð°Ñ… Ð±Ò¯Ñ€Ð´ Ð­Ð Ð“Ð­Ð­Ð” ÑˆÐ¸Ð½Ñ refresh token-Ð¾Ð¾Ñ€ ÑÐ¾Ð»Ð¸Ð½Ð¾ (rotation) â€”
+ * Ñ…ÑƒÑƒÑ‡Ð¸Ð½ token Ð´Ð°Ñ…Ð¸Ð½ Ð°ÑˆÐ¸Ð³Ð»Ð°Ð³Ð´Ð²Ð°Ð» (Ð¼Ð°Ð³Ð°Ð´Ð³Ò¯Ð¹ Ñ…ÑƒÐ»Ð³Ð°Ð¹Ð»Ð°Ð³Ð´ÑÐ°Ð½ Ð³ÑÑÑÐ½ Ò¯Ð³)
+ * ÑˆÑƒÑƒÐ´ Ð¸Ð»Ñ€Ò¯Ò¯Ð»ÑÑ… Ð±Ð¾Ð»Ð¾Ð¼Ð¶Ñ‚Ð¾Ð¹ Ð±Ð¾Ð»Ð³Ð¾Ð½Ð¾.
+ */
+async function refreshAccessToken({ refreshToken, ipAddress, userAgent }) {
+  if (!refreshToken) {
+    throw new AuthError('Refresh token Ð´ÑƒÑ‚ÑƒÑƒ Ð±Ð°Ð¹Ð½Ð°.', 401);
+  }
+
+  const tokenHash = hashRefreshToken(refreshToken);
+
+  const result = await query(
+    `SELECT rt.id, rt.user_id, rt.expires_at, rt.revoked_at,
+            u.id AS uid, u.email, u.full_name, u.role, u.company_id, u.department_id, u.is_active
+     FROM refresh_tokens rt
+     JOIN users u ON u.id = rt.user_id
+     WHERE rt.token_hash = $1`,
+    [tokenHash]
+  );
+
+  const record = result.rows[0];
+
+  if (!record || record.revoked_at || new Date(record.expires_at) < new Date() || !record.is_active) {
+    await auditService.logEvent({
+      userId: record ? record.user_id : null,
+      action: 'LOGIN_FAILED',
+      ipAddress,
+      userAgent,
+      metadata: { reason: 'invalid_refresh_token' },
+    });
+    throw new AuthError('Refresh token Ñ…Ò¯Ñ‡Ð¸Ð½Ð³Ò¯Ð¹ Ð±Ð°Ð¹Ð½Ð°. Ð”Ð°Ñ…Ð¸Ð½ Ð½ÑÐ²Ñ‚ÑÑ€Ð½Ñ Ò¯Ò¯.', 401);
+  }
+
+  // Rotation: Ñ…ÑƒÑƒÑ‡Ð½Ñ‹Ð³ Ñ†ÑƒÑ†Ð°Ð»Ð¶, ÑˆÐ¸Ð½Ð¸Ð¹Ð³ Ò¯Ò¯ÑÐ³ÑÐ½Ñ
+  const { raw: newRaw, hash: newHash } = generateRefreshToken();
+  const expiresAt = new Date();
+  expiresAt.setDate(expiresAt.getDate() + env.jwt.refreshTokenTtlDays);
+
+  await withTransaction(async (client) => {
+    await client.query(`UPDATE refresh_tokens SET revoked_at = now() WHERE id = $1`, [record.id]);
+    await client.query(
+      `INSERT INTO refresh_tokens (user_id, token_hash, expires_at, user_agent, ip_address)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [record.user_id, newHash, expiresAt, userAgent, ipAddress]
+    );
+  });
+
+  const user = {
+    id: record.uid,
+    email: record.email,
+    full_name: record.full_name,
+    role: record.role,
+    company_id: record.company_id,
+    department_id: record.department_id,
+  };
+
+  await auditService.logEvent({ userId: user.id, action: 'TOKEN_REFRESH', ipAddress, userAgent });
+
+  return {
+    accessToken: signAccessToken(user),
+    refreshToken: newRaw,
+    refreshTokenExpiresAt: expiresAt,
+    user,
+  };
+}
+
+async function logout({ refreshToken, userId, ipAddress, userAgent }) {
+  if (refreshToken) {
+    const tokenHash = hashRefreshToken(refreshToken);
+    await query(`UPDATE refresh_tokens SET revoked_at = now() WHERE token_hash = $1 AND revoked_at IS NULL`, [
+      tokenHash,
+    ]);
+  }
+  await auditService.logEvent({ userId, action: 'LOGOUT', ipAddress, userAgent });
+}
+
+module.exports = {
+  AuthError,
+  login,
+  refreshAccessToken,
+  logout,
+  hashPassword,
+  findUserByEmail,
+  sanitizeUser,
+};
+
+
+===== src\services\blobService.js =====
+
+'use strict';
+
+const crypto = require('crypto');
+const {
+  BlobServiceClient,
+  StorageSharedKeyCredential,
+  generateBlobSASQueryParameters,
+  BlobSASPermissions,
+} = require('@azure/storage-blob');
+const env = require('../config/env');
+
+class BlobConfigError extends Error {
+  constructor() {
+    super('Azure Blob Storage Ñ‚Ð¾Ñ…Ð¸Ñ€Ð³Ð¾Ð¾ Ð´ÑƒÑ‚ÑƒÑƒ Ð±Ð°Ð¹Ð½Ð° (.env-Ð¸Ð¹Ð½ AZURE_STORAGE_* Ñ…ÑÑÐ³Ð¸Ð¹Ð³ ÑˆÐ°Ð»Ð³Ð°Ð½Ð° ÑƒÑƒ).');
+    this.name = 'BlobConfigError';
+    this.statusCode = 503;
+  }
+}
+
+function getClient() {
+  const { accountName, accountKey } = env.azureStorage;
+  if (!accountName || !accountKey) {
+    throw new BlobConfigError();
+  }
+  const credential = new StorageSharedKeyCredential(accountName, accountKey);
+  const serviceClient = new BlobServiceClient(
+    `https://${accountName}.blob.core.windows.net`,
+    credential
+  );
+  return { serviceClient, credential };
+}
+
+function sanitizeFileName(fileName) {
+  return fileName
+    .toLowerCase()
+    .replace(/[^a-z0-9.\-_]/g, '-')
+    .slice(-80);
+}
+
+/**
+ * Browser-Ñ ÑˆÑƒÑƒÐ´ Azure Blob Ñ€ÑƒÑƒ (backend server Ð´Ð°Ð¼Ð¶Ð¸Ñ…Ð³Ò¯Ð¹Ð³ÑÑÑ€) upload
+ * Ñ…Ð¸Ð¹Ñ… Ð±Ð¾Ð»Ð¾Ð¼Ð¶ Ð¾Ð»Ð³Ð¾Ñ…, Ð±Ð¾Ð³Ð¸Ð½Ð¾ Ñ…ÑƒÐ³Ð°Ñ†Ð°Ð°Ð½Ð´ (10 Ð¼Ð¸Ð½ÑƒÑ‚) Ñ…Ò¯Ñ‡Ð¸Ð½Ñ‚ÑÐ¹, Ð·Ó©Ð²Ñ…Ó©Ð½ ÑÐ½Ñ
+ * Ð³Ð°Ð½Ñ† blob-Ð´ Ð±Ð¸Ñ‡Ð¸Ñ… ÑÑ€Ñ…Ñ‚ÑÐ¹ SAS URL Ò¯Ò¯ÑÐ³ÑÐ½Ñ.
+ *
+ * @returns {{ uploadUrl: string, publicUrl: string }}
+ */
+function generateUploadUrl(originalFileName, contentType) {
+  const { credential } = getClient();
+  const { accountName, container } = env.azureStorage;
+
+  const blobName = `${crypto.randomUUID()}-${sanitizeFileName(originalFileName)}`;
+
+  const expiresOn = new Date(Date.now() + 10 * 60 * 1000);
+  const sasToken = generateBlobSASQueryParameters(
+    {
+      containerName: container,
+      blobName,
+      permissions: BlobSASPermissions.parse('cw'), // create + write, ÑƒÐ½ÑˆÐ¸Ñ… ÑÑ€Ñ…Ð³Ò¯Ð¹ (upload-Ð´ Ð·Ð¾Ñ€Ð¸ÑƒÐ»Ð°Ð³Ð´ÑÐ°Ð½)
+      startsOn: new Date(Date.now() - 60 * 1000), // clock skew-Ñ ÑÑÑ€Ð³Ð¸Ð¹Ð»Ð¶ 1 Ð¼Ð¸Ð½ Ó©Ð¼Ð½Ó©Ó©Ñ
+      expiresOn,
+      contentType,
+    },
+    credential
+  ).toString();
+
+  const baseUrl = `https://${accountName}.blob.core.windows.net/${container}/${blobName}`;
+
+  return {
+    uploadUrl: `${baseUrl}?${sasToken}`,
+    // Container "Public access: Blob" Ñ‚ÑƒÐ» SAS-Ð³Ò¯Ð¹Ð³ÑÑÑ€ ÑƒÐ½ÑˆÐ¸Ñ… Ð±Ð¾Ð»Ð¾Ð¼Ð¶Ñ‚Ð¾Ð¹ Ð±Ð°Ð¹Ð½Ð³Ñ‹Ð½ URL
+    publicUrl: baseUrl,
+  };
+}
+
+module.exports = { generateUploadUrl, BlobConfigError };
+
+===== src\services\guideBlobService.js =====
+
+'use strict';
+
+const crypto = require('crypto');
+const {
+  BlobServiceClient,
+  StorageSharedKeyCredential,
+  generateBlobSASQueryParameters,
+  BlobSASPermissions,
+} = require('@azure/storage-blob');
+const env = require('../config/env');
+const logger = require('../utils/logger');
+
+class BlobConfigError extends Error {
+  constructor() {
+    super('Azure Blob Storage Ñ‚Ð¾Ñ…Ð¸Ñ€Ð³Ð¾Ð¾ Ð´ÑƒÑ‚ÑƒÑƒ Ð±Ð°Ð¹Ð½Ð° (.env-Ð¸Ð¹Ð½ AZURE_STORAGE_* Ñ…ÑÑÐ³Ð¸Ð¹Ð³ ÑˆÐ°Ð»Ð³Ð°Ð½Ð° ÑƒÑƒ).');
+    this.name = 'BlobConfigError';
+    this.statusCode = 503;
+  }
+}
+
+/**
+ * Ð¡Ð¸ÑÑ‚ÐµÐ¼Ð¸Ð¹Ð½ Ð·Ð°Ð°Ð²Ð°Ñ€ (PDF)-Ð´ Ð·Ð¾Ñ€Ð¸ÑƒÐ»ÑÐ°Ð½ PRIVATE container.
+ * Logo-Ð¸Ð¹Ð½ container ÑˆÐ¸Ð³ public Ð‘Ð˜Ð¨ â€” ÑƒÐ½ÑˆÐ¸Ñ… Ð±Ò¯Ñ€Ñ‚ backend ÑÑ€Ñ… ÑˆÐ°Ð»Ð³Ð°Ð°Ð´
+ * 15 Ð¼Ð¸Ð½ÑƒÑ‚Ñ‹Ð½ read SAS Ò¯Ò¯ÑÐ³ÑÐ½Ñ.
+ *
+ * Azure Portal â†’ Storage account â†’ Containers â†’ "+ Container"
+ *   Name: system-guides, Anonymous access level: Private
+ */
+const GUIDES_CONTAINER = process.env.AZURE_STORAGE_GUIDES_CONTAINER || 'system-guides';
+
+const BLOB_PATH_PATTERN = /^guides\/[0-9a-f-]{36}-[a-z0-9.\-_]+\.pdf$/;
+
+function getClient() {
+  const { accountName, accountKey } = env.azureStorage;
+  if (!accountName || !accountKey) {
+    throw new BlobConfigError();
+  }
+  const credential = new StorageSharedKeyCredential(accountName, accountKey);
+  const serviceClient = new BlobServiceClient(
+    `https://${accountName}.blob.core.windows.net`,
+    credential
+  );
+  return { serviceClient, credential, accountName };
+}
+
+function sanitizeFileName(fileName) {
+  const base = fileName
+    .toLowerCase()
+    .replace(/\.pdf$/i, '')
+    .replace(/[^a-z0-9.\-_]/g, '-')
+    .replace(/-+/g, '-')
+    .slice(-60);
+  return `${base || 'guide'}.pdf`;
+}
+
+/** blob_path Ð½ÑŒ Ð·Ó©Ð²Ñ…Ó©Ð½ ÑÐ½Ñ service-Ð¸Ð¹Ð½ Ò¯Ò¯ÑÐ³ÑÑÑÐ½ Ñ…ÑÐ»Ð±ÑÑ€Ñ‚ÑÐ¹ ÑÑÑÑ…. */
+function isValidGuideBlobPath(blobPath) {
+  return typeof blobPath === 'string' && BLOB_PATH_PATTERN.test(blobPath);
+}
+
+/**
+ * Browser-Ð¾Ð¾Ñ ÑˆÑƒÑƒÐ´ upload Ñ…Ð¸Ð¹Ñ… 10 Ð¼Ð¸Ð½ÑƒÑ‚Ñ‹Ð½ write-only SAS.
+ * @returns {{ uploadUrl: string, blobPath: string }}
+ */
+function generateGuideUploadUrl(originalFileName) {
+  const { credential, accountName } = getClient();
+  const blobPath = `guides/${crypto.randomUUID()}-${sanitizeFileName(originalFileName)}`;
+
+  const sasToken = generateBlobSASQueryParameters(
+    {
+      containerName: GUIDES_CONTAINER,
+      blobName: blobPath,
+      permissions: BlobSASPermissions.parse('cw'),
+      startsOn: new Date(Date.now() - 60 * 1000),
+      expiresOn: new Date(Date.now() + 10 * 60 * 1000),
+    },
+    credential
+  ).toString();
+
+  return {
+    uploadUrl: `https://${accountName}.blob.core.windows.net/${GUIDES_CONTAINER}/${blobPath}?${sasToken}`,
+    blobPath,
+  };
+}
+
+/**
+ * 15 Ð¼Ð¸Ð½ÑƒÑ‚Ñ‹Ð½ read-only SAS. Browser PDF-Ð¸Ð¹Ð³ Ñ‚Ð°Ñ‚Ð°Ñ…Ð³Ò¯Ð¹Ð³ÑÑÑ€ ÑˆÑƒÑƒÐ´ Ñ…Ð°Ñ€ÑƒÑƒÐ»Ð½Ð°
+ * (Content-Disposition: inline), Ñ„Ð°Ð¹Ð»Ñ‹Ð½ Ð½ÑÑ€ Ð½ÑŒ Ð·Ð°Ð°Ð²Ñ€Ñ‹Ð½ Ð³Ð°Ñ€Ñ‡Ð¸Ð³ Ð±Ð°Ð¹Ð½Ð°.
+ */
+function generateGuideReadUrl(blobPath, title) {
+  const { credential, accountName } = getClient();
+
+  const safeTitle = String(title || 'guide').replace(/[\\/:*?"<>|]/g, ' ').trim().slice(0, 120);
+  const contentDisposition = `inline; filename*=UTF-8''${encodeURIComponent(safeTitle)}.pdf`;
+
+  const sasToken = generateBlobSASQueryParameters(
+    {
+      containerName: GUIDES_CONTAINER,
+      blobName: blobPath,
+      permissions: BlobSASPermissions.parse('r'),
+      startsOn: new Date(Date.now() - 60 * 1000),
+      expiresOn: new Date(Date.now() + 15 * 60 * 1000),
+      contentType: 'application/pdf',
+      contentDisposition,
+    },
+    credential
+  ).toString();
+
+  return `https://${accountName}.blob.core.windows.net/${GUIDES_CONTAINER}/${blobPath}?${sasToken}`;
+}
+
+async function streamToBuffer(stream) {
+  const chunks = [];
+  for await (const chunk of stream) chunks.push(Buffer.from(chunk));
+  return Buffer.concat(chunks);
+}
+
+/**
+ * Upload Ñ…Ð¸Ð¹Ð³Ð´ÑÑÐ½ blob-Ð¸Ð¹Ð³ ÑˆÐ°Ð»Ð³Ð°Ð½Ð°. Client-Ð¸Ð¹Ð½ Ñ…ÑÐ»ÑÑÐ½ Ñ…ÑÐ¼Ð¶ÑÑÐ½Ð´ Ð¸Ñ‚Ð³ÑÑ…Ð³Ò¯Ð¹ â€”
+ * Ð¶Ð¸Ð½Ñ…ÑÐ½Ñ Ñ…ÑÐ¼Ð¶ÑÑÐ³ Azure-Ð°Ð°Ñ Ð°Ð²Ñ‡, ÑÑ…Ð½Ð¸Ð¹ Ð±Ð°Ð¹Ñ‚ÑƒÑƒÐ´ "%PDF-" Ð¼Ó©Ð½ ÑÑÑÑ…Ð¸Ð¹Ð³ Ñ…Ð°Ñ€Ð½Ð°.
+ *
+ * @returns {Promise<{ exists: false } | { exists: true, size: number, isPdf: boolean }>}
+ */
+async function inspectGuideBlob(blobPath) {
+  const { serviceClient } = getClient();
+  const blobClient = serviceClient.getContainerClient(GUIDES_CONTAINER).getBlobClient(blobPath);
+
+  let props;
+  try {
+    props = await blobClient.getProperties();
+  } catch (err) {
+    if (err && err.statusCode === 404) return { exists: false };
+    throw err;
+  }
+
+  const head = await blobClient.download(0, 5);
+  const bytes = head.readableStreamBody ? await streamToBuffer(head.readableStreamBody) : Buffer.alloc(0);
+
+  return {
+    exists: true,
+    size: props.contentLength || 0,
+    isPdf: bytes.toString('latin1') === '%PDF-',
+  };
+}
+
+/** ÐÐ»Ð´Ð°Ð° Ð³Ð°Ñ€ÑÐ°Ð½ Ñ‡ throw Ñ…Ð¸Ð¹Ñ…Ð³Ò¯Ð¹ â€” Ð·Ó©Ð²Ñ…Ó©Ð½ log Ð±Ð¸Ñ‡Ð½Ñ. */
+async function deleteGuideBlob(blobPath) {
+  try {
+    const { serviceClient } = getClient();
+    await serviceClient.getContainerClient(GUIDES_CONTAINER).getBlobClient(blobPath).deleteIfExists();
+  } catch (err) {
+    logger.error('Guide blob ÑƒÑÑ‚Ð³Ð°Ð¶ Ñ‡Ð°Ð´ÑÐ°Ð½Ð³Ò¯Ð¹', { blobPath, error: err?.message });
+  }
+}
+
+module.exports = {
+  isValidGuideBlobPath,
+  generateGuideUploadUrl,
+  generateGuideReadUrl,
+  inspectGuideBlob,
+  deleteGuideBlob,
+};
+
+===== src\services\notificationAttachmentBlobService.js =====
+
+'use strict';
+
+const crypto = require('crypto');
+const {
+  BlobServiceClient,
+  StorageSharedKeyCredential,
+  generateBlobSASQueryParameters,
+  BlobSASPermissions,
+} = require('@azure/storage-blob');
+const env = require('../config/env');
+const logger = require('../utils/logger');
+
+/**
+ * ÐœÑÐ´ÑÐ³Ð´Ð»Ð¸Ð¹Ð½ Ñ…Ð°Ð²ÑÑ€Ð°Ð»Ñ‚Ð°Ð´ Ð·Ð¾Ñ€Ð¸ÑƒÐ»ÑÐ°Ð½ PRIVATE container.
+ * Azure Portal â†’ Storage account â†’ Containers â†’ "+ Container"
+ *   Name: notification-attachments, Anonymous access level: Private
+ */
+const CONTAINER =
+  process.env.AZURE_STORAGE_NOTIFICATIONS_CONTAINER || 'notification-attachments';
+
+const MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024;
+
+function isZip(b) {
+  return b[0] === 0x50 && b[1] === 0x4b && b[2] === 0x03 && b[3] === 0x04;
+}
+
+/**
+ * Ð—Ó©Ð²ÑˆÓ©Ó©Ñ€Ó©Ð³Ð´Ó©Ñ… Ñ‚Ó©Ñ€Ð»Ò¯Ò¯Ð´. SVG ÑÐ°Ð½Ð°Ð°Ñ‚Ð°Ð¹Ð³Ð°Ð°Ñ€ ÐžÐ ÐžÐžÐ“Ò®Ð™ (Ð´Ð¾Ñ‚Ð¾Ñ€ Ð½ÑŒ script Ð±Ð°Ð¹Ð¶ Ð±Ð¾Ð»Ð½Ð¾).
+ * magic â€” Ñ„Ð°Ð¹Ð»Ñ‹Ð½ ÑÑ…Ð½Ð¸Ð¹ Ð±Ð°Ð¹Ñ‚ÑƒÑƒÐ´Ð°Ð°Ñ€ Ð¶Ð¸Ð½Ñ…ÑÐ½Ñ Ñ‚Ó©Ñ€Ð»Ð¸Ð¹Ð³ ÑˆÐ°Ð»Ð³Ð°Ð½Ð°.
+ */
+const ALLOWED_TYPES = {
+  'image/png': {
+    ext: 'png',
+    inline: true,
+    magic: (b) => b.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])),
+  },
+  'image/jpeg': { ext: 'jpg', inline: true, magic: (b) => b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff },
+  'image/webp': {
+    ext: 'webp',
+    inline: true,
+    magic: (b) => b.toString('latin1', 0, 4) === 'RIFF' && b.toString('latin1', 8, 12) === 'WEBP',
+  },
+  'application/pdf': { ext: 'pdf', inline: true, magic: (b) => b.toString('latin1', 0, 5) === '%PDF-' },
+  // Office Ñ„Ð°Ð¹Ð»ÑƒÑƒÐ´ Ð½ÑŒ Ð´Ð¾Ñ‚Ñ€Ð¾Ð¾ ZIP ("PK\x03\x04")
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': { ext: 'docx', inline: false, magic: isZip },
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': { ext: 'xlsx', inline: false, magic: isZip },
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation': { ext: 'pptx', inline: false, magic: isZip },
+};
+
+const BLOB_PATH_PATTERN = /^notifications\/[0-9a-f-]{36}\.(png|jpg|webp|pdf|docx|xlsx|pptx)$/;
+
+class BlobConfigError extends Error {
+  constructor() {
+    super('Azure Blob Storage Ñ‚Ð¾Ñ…Ð¸Ñ€Ð³Ð¾Ð¾ Ð´ÑƒÑ‚ÑƒÑƒ Ð±Ð°Ð¹Ð½Ð° (.env-Ð¸Ð¹Ð½ AZURE_STORAGE_* Ñ…ÑÑÐ³Ð¸Ð¹Ð³ ÑˆÐ°Ð»Ð³Ð°Ð½Ð° ÑƒÑƒ).');
+    this.name = 'BlobConfigError';
+    this.statusCode = 503;
+  }
+}
+
+function getClient() {
+  const { accountName, accountKey } = env.azureStorage;
+  if (!accountName || !accountKey) throw new BlobConfigError();
+  const credential = new StorageSharedKeyCredential(accountName, accountKey);
+  const serviceClient = new BlobServiceClient(`https://${accountName}.blob.core.windows.net`, credential);
+  return { serviceClient, credential, accountName };
+}
+
+function isAllowedType(contentType) {
+  return typeof contentType === 'string' && Object.prototype.hasOwnProperty.call(ALLOWED_TYPES, contentType);
+}
+
+function isValidAttachmentBlobPath(blobPath, contentType) {
+  if (typeof blobPath !== 'string' || !BLOB_PATH_PATTERN.test(blobPath)) return false;
+  // Ð—Ð°Ð¼Ñ‹Ð½ Ó©Ñ€Ð³Ó©Ñ‚Ð³Ó©Ð» Ð½ÑŒ Ð·Ð°Ñ€Ð»Ð°ÑÐ°Ð½ Ñ‚Ó©Ñ€Ó©Ð»Ñ‚ÑÐ¹ Ñ‚Ð°Ð°Ñ€Ð°Ñ… Ñ‘ÑÑ‚Ð¾Ð¹
+  return isAllowedType(contentType) && blobPath.endsWith(`.${ALLOWED_TYPES[contentType].ext}`);
+}
+
+/** Browser-Ð¾Ð¾Ñ ÑˆÑƒÑƒÐ´ upload Ñ…Ð¸Ð¹Ñ… 10 Ð¼Ð¸Ð½ÑƒÑ‚Ñ‹Ð½ write-only SAS. */
+function generateAttachmentUploadUrl(contentType) {
+  const { credential, accountName } = getClient();
+  const blobPath = `notifications/${crypto.randomUUID()}.${ALLOWED_TYPES[contentType].ext}`;
+
+  const sas = generateBlobSASQueryParameters(
+    {
+      containerName: CONTAINER,
+      blobName: blobPath,
+      permissions: BlobSASPermissions.parse('cw'),
+      startsOn: new Date(Date.now() - 60 * 1000),
+      expiresOn: new Date(Date.now() + 10 * 60 * 1000),
+    },
+    credential
+  ).toString();
+
+  return {
+    uploadUrl: `https://${accountName}.blob.core.windows.net/${CONTAINER}/${blobPath}?${sas}`,
+    blobPath,
+  };
+}
+
+/**
+ * 15 Ð¼Ð¸Ð½ÑƒÑ‚Ñ‹Ð½ read-only SAS. Ð—ÑƒÑ€Ð°Ð³/PDF browser Ð´Ð¾Ñ‚Ð¾Ñ€ Ð½ÑÑÐ³Ð´ÑÐ½Ñ, Office
+ * Ñ„Ð°Ð¹Ð» Ñ‚Ð°Ñ‚Ð°Ð³Ð´Ð°Ð½Ð°. Ð¤Ð°Ð¹Ð»Ñ‹Ð½ Ð½ÑÑ€ Ð½ÑŒ Ð°Ð½Ñ…Ð½Ñ‹ Ð½ÑÑ€ÑÑÑ€ÑÑ Ñ…Ð°Ñ€Ð°Ð³Ð´Ð°Ð½Ð°.
+ */
+function generateAttachmentReadUrl(blobPath, fileName, contentType) {
+  const { credential, accountName } = getClient();
+  const type = ALLOWED_TYPES[contentType];
+  const safeName =
+    String(fileName || 'file').replace(/[\\/:*?"<>|]/g, ' ').trim().slice(0, 150) || 'file';
+  const disposition = `${type && type.inline ? 'inline' : 'attachment'}; filename*=UTF-8''${encodeURIComponent(safeName)}`;
+
+  const sas = generateBlobSASQueryParameters(
+    {
+      containerName: CONTAINER,
+      blobName: blobPath,
+      permissions: BlobSASPermissions.parse('r'),
+      startsOn: new Date(Date.now() - 60 * 1000),
+      expiresOn: new Date(Date.now() + 15 * 60 * 1000),
+      contentType,
+      contentDisposition: disposition,
+    },
+    credential
+  ).toString();
+
+  return `https://${accountName}.blob.core.windows.net/${CONTAINER}/${blobPath}?${sas}`;
+}
+
+async function streamToBuffer(stream) {
+  const chunks = [];
+  for await (const chunk of stream) chunks.push(Buffer.from(chunk));
+  return Buffer.concat(chunks);
+}
+
+async function deleteAttachmentBlob(blobPath) {
+  try {
+    const { serviceClient } = getClient();
+    await serviceClient.getContainerClient(CONTAINER).getBlobClient(blobPath).deleteIfExists();
+  } catch (err) {
+    logger.error('Ð¥Ð°Ð²ÑÑ€Ð°Ð»Ñ‚Ñ‹Ð½ blob ÑƒÑÑ‚Ð³Ð°Ð¶ Ñ‡Ð°Ð´ÑÐ°Ð½Ð³Ò¯Ð¹', { blobPath, error: err?.message });
+  }
+}
+
+/**
+ * Upload Ñ…Ð¸Ð¹Ð³Ð´ÑÑÐ½ blob-Ð¸Ð¹Ð³ ÑˆÐ°Ð»Ð³Ð°Ð½Ð°: Ð±Ð°Ð¹Ð³Ð°Ð° ÑÑÑÑ…, Ð¶Ð¸Ð½Ñ…ÑÐ½Ñ Ñ…ÑÐ¼Ð¶ÑÑ,
+ * ÑÑ…Ð½Ð¸Ð¹ Ð±Ð°Ð¹Ñ‚ÑƒÑƒÐ´ Ð·Ð°Ñ€Ð»Ð°ÑÐ°Ð½ Ñ‚Ó©Ñ€Ó©Ð»Ñ‚ÑÐ¹ Ñ‚Ð°Ð°Ñ€Ð°Ñ… ÑÑÑÑ….
+ * @returns {Promise<{ ok: true, size: number } | { ok: false, error: string }>}
+ */
+async function verifyAttachmentBlob(blobPath, contentType) {
+  const { serviceClient } = getClient();
+  const blobClient = serviceClient.getContainerClient(CONTAINER).getBlobClient(blobPath);
+
+  let props;
+  try {
+    props = await blobClient.getProperties();
+  } catch (err) {
+    if (err && err.statusCode === 404) {
+      return { ok: false, error: 'Ð¥Ð°Ð²ÑÑ€Ð°Ð»Ñ‚ Ð±Ð°Ð¹Ñ€ÑˆÑƒÑƒÐ»Ð°Ð³Ð´Ð°Ð°Ð³Ò¯Ð¹ Ð±Ð°Ð¹Ð½Ð°. Ð”Ð°Ñ…Ð¸Ð½ Ð¾Ñ€Ð¾Ð»Ð´Ð¾Ð½Ð¾ ÑƒÑƒ.' };
+    }
+    throw err;
+  }
+
+  const size = props.contentLength || 0;
+  if (size === 0 || size > MAX_ATTACHMENT_SIZE) {
+    await deleteAttachmentBlob(blobPath);
+    return { ok: false, error: 'Ð¥Ð°Ð²ÑÑ€Ð°Ð»Ñ‚Ñ‹Ð½ Ñ…ÑÐ¼Ð¶ÑÑ 10MB-Ñ Ñ…ÑÑ‚ÑÑ€ÑÑÐ½ Ð±Ð°Ð¹Ð½Ð°.' };
+  }
+
+  const head = await blobClient.download(0, 12);
+  const bytes = head.readableStreamBody ? await streamToBuffer(head.readableStreamBody) : Buffer.alloc(0);
+  if (bytes.length < 4 || !ALLOWED_TYPES[contentType].magic(bytes)) {
+    await deleteAttachmentBlob(blobPath);
+    return { ok: false, error: 'Ð¥Ð°Ð²ÑÑ€Ð°Ð»Ñ‚Ñ‹Ð½ Ñ„Ð°Ð¹Ð»Ñ‹Ð½ Ñ‚Ó©Ñ€Ó©Ð» Ð·Ó©Ð²ÑˆÓ©Ó©Ñ€Ó©Ð³Ð´Ó©Ó©Ð³Ò¯Ð¹ ÑÑÐ²ÑÐ» ÑÐ²Ð´ÑÑ€ÑÑÐ½ Ð±Ð°Ð¹Ð½Ð°.' };
+  }
+
+  return { ok: true, size };
+}
+
+module.exports = {
+  MAX_ATTACHMENT_SIZE,
+  isAllowedType,
+  isValidAttachmentBlobPath,
+  generateAttachmentUploadUrl,
+  generateAttachmentReadUrl,
+  verifyAttachmentBlob,
+  deleteAttachmentBlob,
+};
+
+===== src\services\userService.js =====
+
+'use strict';
+
+const { hashPassword } = require('./authService');
+
+/**
+ * ÐšÐ¾Ð¼Ð¿Ð°Ð½Ð¸/Ñ…ÑÐ»Ñ‚ÑÑÐ¸Ð¹Ð½ Ð°Ð´Ð¼Ð¸Ð½ Ñ…ÑÑ€ÑÐ³Ð»ÑÐ³Ñ‡ (login) Ò¯Ò¯ÑÐ³ÑÑ… Ð½Ð¸Ð¹Ñ‚Ð»ÑÐ³ Ð»Ð¾Ð³Ð¸Ðº.
+ * "executor" Ð½ÑŒ ÑÑÐ²ÑÐ» config/db.js-Ð¸Ð¹Ð½ `pool`, ÑÑÐ²ÑÐ» transaction Ð´Ð¾Ñ‚Ð¾Ñ€Ñ…
+ * `client` Ð±Ð°Ð¹Ð¶ Ð±Ð¾Ð»Ð½Ð¾ â€” Ñ…Ð¾Ñ‘ÑƒÐ» Ð¸Ð¶Ð¸Ð» .query(text, params) Ð¸Ð½Ñ‚ÐµÑ€Ñ„ÑÐ¹ÑÑ‚ÑÐ¹ Ñ‚ÑƒÐ»
+ * ÑÐ½Ñ Ñ„ÑƒÐ½ÐºÑ† Ñ…ÑÐ·ÑÑ transaction Ð´Ð¾Ñ‚Ð¾Ñ€, Ñ…ÑÐ·ÑÑ Ð´Ð°Ð½Ð³Ð°Ð°Ñ€Ð°Ð° Ð´ÑƒÑƒÐ´Ð°Ð³Ð´Ð°Ñ…Ð°Ð°Ñ
+ * Ò¯Ð» Ñ…Ð°Ð¼Ð°Ð°Ñ€Ð°Ð½ Ð°Ð¶Ð¸Ð»Ð»Ð°Ð½Ð°.
+ */
+async function createLinkedUser(executor, { email, password, fullName, role, companyId, departmentId = null }) {
+  const existing = await executor.query(
+    `SELECT id FROM users WHERE lower(email) = lower($1) AND deleted_at IS NULL`,
+    [email]
+  );
+  if (existing.rows.length > 0) {
+    const err = new Error('Ð­Ð½Ñ Ð¸Ð¼ÑÐ¹Ð» Ñ…Ð°ÑÐ³ Ó©Ó©Ñ€ Ñ…ÑÑ€ÑÐ³Ð»ÑÐ³Ñ‡Ð¸Ð´ Ð±Ò¯Ñ€Ñ‚Ð³ÑÐ»Ñ‚ÑÐ¹ Ð±Ð°Ð¹Ð½Ð°.');
+    err.statusCode = 409;
+    throw err;
+  }
+
+  const passwordHash = await hashPassword(password);
+
+  const result = await executor.query(
+    `INSERT INTO users (email, password_hash, full_name, role, company_id, department_id, is_active)
+     VALUES ($1, $2, $3, $4, $5, $6, true)
+     RETURNING id, email, full_name, role, company_id, department_id`,
+    [email, passwordHash, fullName, role, companyId, departmentId]
+  );
+
+  return result.rows[0];
+}
+
+module.exports = { createLinkedUser };
+
+===== src\utils\jwt.js =====
+
+'use strict';
+
+const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
+const env = require('../config/env');
+
+/**
+ * Access token â€” Ð°Ð¼ÑŒÐ´Ñ€Ð°Ñ… Ñ…ÑƒÐ³Ð°Ñ†Ð°Ð° Ð±Ð¾Ð³Ð¸Ð½Ð¾ (default 30 Ð¼Ð¸Ð½ÑƒÑ‚).
+ * Payload Ð´Ð¾Ñ‚Ð¾Ñ€ company_id/department_id-Ð³ Ð¾Ñ€ÑƒÑƒÐ»ÑÐ½Ð°Ð°Ñ€ Ð´Ð°Ñ€Ð°Ð°Ð³Ð¸Ð¹Ð½
+ * ÑˆÐ°Ñ‚Ð°Ð½Ð´ (RLS session variable Ñ‚Ð¾Ñ…Ð¸Ñ€ÑƒÑƒÐ»Ð°Ñ… middleware) ÑˆÑƒÑƒÐ´
+ * Ð°ÑˆÐ¸Ð³Ð»Ð°Ñ… Ð±Ð¾Ð»Ð¾Ð¼Ð¶Ñ‚Ð¾Ð¹ Ð±Ð¾Ð»Ð½Ð¾.
+ */
+function signAccessToken(user) {
+  return jwt.sign(
+    {
+      sub: user.id,
+      role: user.role,
+      companyId: user.company_id,
+      departmentId: user.department_id,
+    },
+    env.jwt.accessTokenSecret,
+    { expiresIn: env.jwt.accessTokenTtl }
+  );
+}
+
+function verifyAccessToken(token) {
+  return jwt.verify(token, env.jwt.accessTokenSecret);
+}
+
+/**
+ * Refresh token â€” ÑÐ°Ð½Ð°Ð¼ÑÐ°Ñ€Ð³Ò¯Ð¹, ÑƒÑ€Ñ‚ (256 Ð±Ð¸Ñ‚) ÑƒÑ‚Ð³Ð°. ÐšÐ»Ð¸ÐµÐ½Ñ‚ Ñ€Ò¯Ò¯ Ð·Ó©Ð²Ñ…Ó©Ð½
+ * ÑÐ½Ñ raw ÑƒÑ‚Ð³Ñ‹Ð³ ÑÐ²ÑƒÑƒÐ»Ð½Ð°; DB-Ð´ Ð·Ó©Ð²Ñ…Ó©Ð½ sha256 hash-Ð¸Ð¹Ð³ Ð½ÑŒ Ñ…Ð°Ð´Ð³Ð°Ð»Ð½Ð° â€”
+ * Ð¸Ð½Ð³ÑÑÐ½ÑÑÑ€ DB Ð°Ð»Ð´Ð°Ð³Ð´ÑÐ°Ð½ Ñ‡ Ð³ÑÑÑÐ½ refresh token-ÑƒÑƒÐ´Ñ‹Ð³ ÑˆÑƒÑƒÐ´ Ð°ÑˆÐ¸Ð³Ð»Ð°Ñ…
+ * Ð±Ð¾Ð»Ð¾Ð¼Ð¶Ð³Ò¯Ð¹ Ð±Ð¾Ð»Ð½Ð¾.
+ */
+function generateRefreshToken() {
+  const raw = crypto.randomBytes(64).toString('hex');
+  const hash = hashRefreshToken(raw);
+  return { raw, hash };
+}
+
+function hashRefreshToken(raw) {
+  return crypto.createHash('sha256').update(raw).digest('hex');
+}
+
+module.exports = {
+  signAccessToken,
+  verifyAccessToken,
+  generateRefreshToken,
+  hashRefreshToken,
+};
+
+
+===== src\utils\logger.js =====
+
+'use strict';
+
+// Ð­Ð½Ð³Ð¸Ð¹Ð½ structured logger. Ð¥Ð¾Ð¶Ð¸Ð¼ Azure Monitor/Application Insights
+// Ñ€ÑƒÑƒ Ð´Ð°Ð¼Ð¶ÑƒÑƒÐ»Ð°Ñ… Ð±Ð¾Ð» ÑÐ½Ñ Ñ„Ð°Ð¹Ð»Ñ‹Ð³ Ð» ÑÐ¾Ð»ÑŒÐ¶ Ð±Ð¸Ñ‡Ð¸Ñ…ÑÐ´ Ñ…Ð°Ð½Ð³Ð°Ð»Ñ‚Ñ‚Ð°Ð¹ â€” Ð±ÑƒÑÐ°Ð´ ÐºÐ¾Ð´
+// logger.info/error-Ð³ Ð» Ð´ÑƒÑƒÐ´Ð½Ð°.
+function log(level, message, meta) {
+  const entry = {
+    level,
+    message,
+    ...(meta ? { meta } : {}),
+    timestamp: new Date().toISOString(),
+  };
+  // eslint-disable-next-line no-console
+  console[level === 'error' ? 'error' : 'log'](JSON.stringify(entry));
+}
+
+module.exports = {
+  info: (message, meta) => log('info', message, meta),
+  warn: (message, meta) => log('warn', message, meta),
+  error: (message, meta) => log('error', message, meta),
+};
+
+
+===== src\app.js =====
+
+'use strict';
+
+const express = require('express');
+const helmet = require('helmet');
+const cors = require('cors');
+const cookieParser = require('cookie-parser');
+
+const env = require('./config/env');
+const authRoutes = require('./routes/authRoutes');
+const adminRoutes = require('./routes/adminRoutes');
+const companyRoutes = require('./routes/companyRoutes');
+const departmentTemplateRoutes = require('./routes/departmentTemplateRoutes');
+const departmentRoutes = require('./routes/departmentRoutes');
+const formSubmissionRoutes = require('./routes/formSubmissionRoutes');
+const editRequestRoutes = require('./routes/editRequestRoutes');
+const errorHandler = require('./middleware/errorHandler');
+const analyticsRoutes = require('./routes/analyticsRoutes');
+const systemGuideRoutes = require('./routes/systemGuideRoutes');
+const notificationRoutes = require('./routes/notificationRoutes');
+
+const app = express();
+
+app.set('trust proxy', 1);
+
+app.use(helmet());
+app.use(
+  cors({
+    origin: env.corsOrigins.length > 0 ? env.corsOrigins : false,
+    credentials: true,
+  })
+);
+app.use(express.json({ limit: '1mb' }));
+app.use(cookieParser());
+
+app.get('/health', (req, res) => res.json({ status: 'ok' }));
+
+app.use('/api/auth', authRoutes);
+app.use('/api/admin', adminRoutes);
+app.use('/api/companies', companyRoutes);
+app.use('/api/department-templates', departmentTemplateRoutes);
+app.use('/api/departments', departmentRoutes);
+app.use('/api/form-submissions', formSubmissionRoutes);
+app.use('/api/edit-requests', editRequestRoutes);
+app.use('/api/analytics', analyticsRoutes);
+app.use('/api/system-guides', systemGuideRoutes);
+app.use('/api/notifications', notificationRoutes);
+
+app.use((req, res) => {
+  res.status(404).json({ error: 'Route Ð¾Ð»Ð´ÑÐ¾Ð½Ð³Ò¯Ð¹.' });
+});
+
+app.use(errorHandler);
+
+module.exports = app;
+
+===== src\server.js =====
+
+'use strict';
+
+const app = require('./app');
+const env = require('./config/env');
+const logger = require('./utils/logger');
+const { pool } = require('./config/db');
+
+const server = app.listen(env.port, () => {
+  logger.info(`Server Ð°Ð¶Ð¸Ð»Ð»Ð°Ð¶ ÑÑ…ÑÐ»Ð»ÑÑ`, { port: env.port, env: env.nodeEnv });
+});
+
+// Graceful shutdown â€” Azure App Service restart/deploy Ñ…Ð¸Ð¹Ñ…ÑÐ´
+// Ð¸Ð´ÑÐ²Ñ…Ñ‚ÑÐ¹ DB connection-ÑƒÑƒÐ´Ñ‹Ð³ Ð·Ó©Ð² Ñ…Ð°Ð°Ð½Ð°.
+async function shutdown(signal) {
+  logger.info(`${signal} Ñ…Ò¯Ð»ÑÑÐ½ Ð°Ð²Ð»Ð°Ð°, ÑÐµÑ€Ð²ÐµÑ€Ð¸Ð¹Ð³ Ð·Ð¾Ð³ÑÐ¾Ð¾Ð¶ Ð±Ð°Ð¹Ð½Ð°...`);
+  server.close(async () => {
+    await pool.end();
+    logger.info('Ð¡ÐµÑ€Ð²ÐµÑ€ Ð·Ð¾Ð³ÑÐ»Ð¾Ð¾.');
+    process.exit(0);
+  });
+
+  // Ð¥ÑÑ‚ ÑƒÐ´Ð²Ð°Ð» Ñ…Ò¯Ñ‡ÑÑÑ€ Ð·Ð¾Ð³ÑÐ¾Ð¾Ð½Ð¾
+  setTimeout(() => process.exit(1), 10000).unref();
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+
+process.on('unhandledRejection', (reason) => {
+  logger.error('Unhandled promise rejection', { reason: reason?.message || reason });
+});
+

@@ -15,6 +15,8 @@ const formSubmissionRoutes = require('./routes/formSubmissionRoutes');
 const editRequestRoutes = require('./routes/editRequestRoutes');
 const errorHandler = require('./middleware/errorHandler');
 const analyticsRoutes = require('./routes/analyticsRoutes');
+const systemGuideRoutes = require('./routes/systemGuideRoutes');
+const notificationRoutes = require('./routes/notificationRoutes');
 
 const app = express();
 
@@ -40,6 +42,8 @@ app.use('/api/departments', departmentRoutes);
 app.use('/api/form-submissions', formSubmissionRoutes);
 app.use('/api/edit-requests', editRequestRoutes);
 app.use('/api/analytics', analyticsRoutes);
+app.use('/api/system-guides', systemGuideRoutes);
+app.use('/api/notifications', notificationRoutes);
 
 app.use((req, res) => {
   res.status(404).json({ error: 'Route олдсонгүй.' });
