@@ -25,6 +25,7 @@ router.get('/sent', ...admin, notificationController.listSent);
 router.post('/', ...admin, notificationController.create);
 router.get('/:id/recipients', ...admin, notificationController.listRecipientStatus);
 router.delete('/:id', ...admin, notificationController.remove);
+router.post('/:id/retry-email', ...admin, notificationController.retryEmail);
 
 // Хавсралт — controller дотор эрх (хүлээн авагч эсэх) шалгана
 router.get('/:id/attachments', ...anyRole, notificationController.listAttachments);

@@ -109,6 +109,8 @@ async function create(req, res, next) {
   const title = typeof body.title === 'string' ? body.title.trim() : '';
   const text = typeof body.body === 'string' ? body.body.trim() : '';
   const target = body.target;
+  // Имэйлээр давхар илгээх эсэх — зөвхөн тодорхой true ирвэл
+  const sendEmail = body.send_email === true;
 
   if (title.length < 2 || title.length > 200) {
     return res.status(400).json({ error: 'Гарчиг 2-200 тэмдэгттэй байх ёстой.' });
@@ -141,12 +143,14 @@ async function create(req, res, next) {
   }
 
   try {
+    const emailStatus = sendEmail ? 'pending' : 'not_requested';
+
     const notification = await withTransaction(async (client) => {
       const inserted = await client.query(
-        `INSERT INTO notifications (title, body, target_type, created_by)
-         VALUES ($1, $2, $3, $4)
-         RETURNING id, title, body, target_type, created_at`,
-        [title, text, target, req.auth.userId]
+        `INSERT INTO notifications (title, body, target_type, created_by, send_email)
+         VALUES ($1, $2, $3, $4, $5)
+         RETURNING id, title, body, target_type, send_email, created_at`,
+        [title, text, target, req.auth.userId, sendEmail]
       );
       const row = inserted.rows[0];
 
@@ -155,15 +159,15 @@ async function create(req, res, next) {
       const recipients =
         target === 'all'
           ? await client.query(
-              `INSERT INTO notification_recipients (notification_id, user_id)
-               SELECT $1, e.id FROM (${ELIGIBLE_USERS_SQL}) e`,
-              [row.id]
+              `INSERT INTO notification_recipients (notification_id, user_id, email_status)
+               SELECT $1, e.id, $2 FROM (${ELIGIBLE_USERS_SQL}) e`,
+              [row.id, emailStatus]
             )
           : await client.query(
-              `INSERT INTO notification_recipients (notification_id, user_id)
-               SELECT $1, e.id FROM (${ELIGIBLE_USERS_SQL}) e
+              `INSERT INTO notification_recipients (notification_id, user_id, email_status)
+               SELECT $1, e.id, $3 FROM (${ELIGIBLE_USERS_SQL}) e
                WHERE e.id = ANY($2)`,
-              [row.id, userIds]
+              [row.id, userIds, emailStatus]
             );
 
       if (recipients.rowCount === 0) {
@@ -182,7 +186,13 @@ async function create(req, res, next) {
         );
       }
 
-      return { ...row, recipient_count: recipients.rowCount };
+      return {
+        ...row,
+        recipient_count: recipients.rowCount,
+        email_sent_count: 0,
+        email_pending_count: sendEmail ? recipients.rowCount : 0,
+        email_failed_count: 0,
+      };
     });
 
     return res.status(201).json({
@@ -203,9 +213,12 @@ async function listSent(req, res, next) {
   try {
     const result = await query(
       `SELECT
-         n.id, n.title, n.body, n.target_type, n.created_at,
+         n.id, n.title, n.body, n.target_type, n.send_email, n.created_at,
          count(r.user_id)::int AS recipient_count,
          count(r.read_at)::int AS read_count,
+         count(*) FILTER (WHERE r.email_status = 'sent')::int AS email_sent_count,
+         count(*) FILTER (WHERE r.email_status IN ('pending', 'sending'))::int AS email_pending_count,
+         count(*) FILTER (WHERE r.email_status = 'failed')::int AS email_failed_count,
          ${ATTACHMENT_COUNT_SQL} AS attachment_count
        FROM notifications n
        LEFT JOIN notification_recipients r ON r.notification_id = n.id
@@ -234,7 +247,7 @@ async function listRecipientStatus(req, res, next) {
 
     const result = await query(
       `SELECT
-         r.user_id, r.read_at,
+         r.user_id, r.read_at, r.email_status, r.email_sent_at,
          u.full_name, u.email, u.role,
          c.name AS company_name,
          d.name AS department_name
@@ -269,6 +282,36 @@ async function remove(req, res, next) {
     );
     if (result.rowCount === 0) return res.status(404).json({ error: 'Мэдэгдэл олдсонгүй.' });
     return res.status(204).end();
+  } catch (err) {
+    return next(err);
+  }
+}
+
+/**
+ * 'failed' төлөвтэй имэйлүүдийг дахин дараалалд оруулна.
+ * Worker дараагийн эргэлтэд (≤15 сек) илгээнэ.
+ */
+async function retryEmail(req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!UUID_PATTERN.test(id)) return res.status(404).json({ error: 'Мэдэгдэл олдсонгүй.' });
+
+    const exists = await query(
+      `SELECT 1 FROM notifications WHERE id = $1 AND deleted_at IS NULL`,
+      [id]
+    );
+    if (exists.rowCount === 0) return res.status(404).json({ error: 'Мэдэгдэл олдсонгүй.' });
+
+    const result = await query(
+      `UPDATE notification_recipients
+       SET email_status = 'pending',
+           email_attempts = 0,
+           email_next_attempt_at = NULL,
+           email_last_error = NULL
+       WHERE notification_id = $1 AND email_status = 'failed'`,
+      [id]
+    );
+    return res.json({ requeued: result.rowCount });
   } catch (err) {
     return next(err);
   }
@@ -404,6 +447,7 @@ module.exports = {
   listSent,
   listRecipientStatus,
   remove,
+  retryEmail,
   listMine,
   unreadCount,
   markRead,

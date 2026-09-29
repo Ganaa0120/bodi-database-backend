@@ -17,6 +17,7 @@ const errorHandler = require('./middleware/errorHandler');
 const analyticsRoutes = require('./routes/analyticsRoutes');
 const systemGuideRoutes = require('./routes/systemGuideRoutes');
 const notificationRoutes = require('./routes/notificationRoutes');
+const emailWorker = require('./workers/emailWorker');
 
 const app = express();
 
@@ -50,5 +51,8 @@ app.use((req, res) => {
 });
 
 app.use(errorHandler);
+
+// Мэдэгдлийн имэйлийн outbox worker (EMAIL_WORKER_ENABLED=false бол асахгүй)
+emailWorker.start();
 
 module.exports = app;
