@@ -209,11 +209,27 @@ function systemContext(req, res, next) {
   return runRequestInContext(req, res, next, { role: "system" });
 }
 
+/**
+ * HTTP хүсэлтгүй background ажил (email worker гэх мэт)-д зориулсан
+ * system context. fn дууссаны дараа connection-ийг цэвэрлээд pool руу буцаана.
+ */
+function runInSystemContext(fn) {
+  const store = createContext({ role: 'system' });
+  return contextStorage.run(store, async () => {
+    try {
+      return await fn();
+    } finally {
+      markEnded(store);
+    }
+  });
+}
+
 module.exports = {
   pool,
   query,
   withTransaction,
   runRequestInContext,
   systemContext,
+  runInSystemContext,
   DbContextError,
 };

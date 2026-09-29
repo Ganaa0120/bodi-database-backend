@@ -1,8 +1,8 @@
-'use strict';
+"use strict";
 
-const { query, runInSystemContext } = require('../config/db');
-const mailService = require('../services/mailService');
-const logger = require('../utils/logger');
+const { query, runInSystemContext } = require("../config/db");
+const mailService = require("../services/mailService");
+const logger = require("../utils/logger");
 
 /**
  * Мэдэгдлийн имэйлийн outbox worker.
@@ -37,10 +37,12 @@ async function recoverStuck() {
      SET email_status = 'pending', email_next_attempt_at = now()
      WHERE email_status = 'sending'
        AND email_last_attempt_at < now() - make_interval(mins => $1)`,
-    [STUCK_MINUTES]
+    [STUCK_MINUTES],
   );
   if (result.rowCount > 0) {
-    logger.warn('Гацсан имэйлүүдийг дахин дараалалд орууллаа', { count: result.rowCount });
+    logger.warn("Гацсан имэйлүүдийг дахин дараалалд орууллаа", {
+      count: result.rowCount,
+    });
   }
 }
 
@@ -62,7 +64,7 @@ async function claimBatch() {
      WHERE r.notification_id = pick.notification_id
        AND r.user_id = pick.user_id
      RETURNING r.notification_id, r.user_id, r.email_attempts`,
-    [BATCH_SIZE]
+    [BATCH_SIZE],
   );
   return result.rows;
 }
@@ -76,12 +78,16 @@ async function loadJob(notificationId, userId) {
      FROM notifications n
      JOIN users u ON u.id = $2
      WHERE n.id = $1`,
-    [notificationId, userId]
+    [notificationId, userId],
   );
   return result.rows[0] || null;
 }
 
-async function markStatus(job, status, { error = null, retryInSeconds = null } = {}) {
+async function markStatus(
+  job,
+  status,
+  { error = null, retryInSeconds = null } = {},
+) {
   await query(
     `UPDATE notification_recipients
      SET email_status = $3,
@@ -96,15 +102,23 @@ async function markStatus(job, status, { error = null, retryInSeconds = null } =
       status,
       error ? String(error).slice(0, 500) : null,
       retryInSeconds,
-    ]
+    ],
   );
 }
 
 async function processJob(job) {
   const data = await loadJob(job.notification_id, job.user_id);
 
-  if (!data || data.notification_deleted_at || data.user_deleted_at || !data.is_active || !data.email) {
-    await markStatus(job, 'skipped', { error: 'Мэдэгдэл эсвэл хүлээн авагч идэвхгүй болсон.' });
+  if (
+    !data ||
+    data.notification_deleted_at ||
+    data.user_deleted_at ||
+    !data.is_active ||
+    !data.email
+  ) {
+    await markStatus(job, "skipped", {
+      error: "Мэдэгдэл эсвэл хүлээн авагч идэвхгүй болсон.",
+    });
     return;
   }
 
@@ -116,19 +130,24 @@ async function processJob(job) {
       attachmentCount: data.attachment_count,
     });
     await mailService.sendMail({ to: data.email, subject, html });
-    await markStatus(job, 'sent');
+    await markStatus(job, "sent");
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     const canRetry = !err.permanent && job.email_attempts < MAX_ATTEMPTS;
 
     if (canRetry) {
       const delay =
-        RETRY_DELAYS_SECONDS[Math.min(job.email_attempts - 1, RETRY_DELAYS_SECONDS.length - 1)];
-      await markStatus(job, 'pending', { error: message, retryInSeconds: delay });
+        RETRY_DELAYS_SECONDS[
+          Math.min(job.email_attempts - 1, RETRY_DELAYS_SECONDS.length - 1)
+        ];
+      await markStatus(job, "pending", {
+        error: message,
+        retryInSeconds: delay,
+      });
     } else {
-      await markStatus(job, 'failed', { error: message });
+      await markStatus(job, "failed", { error: message });
     }
-    logger.error('Мэдэгдлийн имэйл илгээж чадсангүй', {
+    logger.error("Мэдэгдлийн имэйл илгээж чадсангүй", {
       notificationId: job.notification_id,
       userId: job.user_id,
       attempt: job.email_attempts,
@@ -144,7 +163,9 @@ async function tick() {
   try {
     if (!mailService.isConfigured()) {
       if (!warnedNotConfigured) {
-        logger.warn('Имэйлийн тохиргоо дутуу — мэдэгдлийн имэйлүүд pending төлөвтэй хүлээнэ.');
+        logger.warn(
+          "Имэйлийн тохиргоо дутуу — мэдэгдлийн имэйлүүд pending төлөвтэй хүлээнэ.",
+        );
         warnedNotConfigured = true;
       }
       return;
@@ -159,7 +180,9 @@ async function tick() {
       }
     });
   } catch (err) {
-    logger.error('Email worker алдаа', { error: err instanceof Error ? err.message : String(err) });
+    logger.error("Email worker алдаа", {
+      error: err instanceof Error ? err.message : String(err),
+    });
   } finally {
     running = false;
   }
@@ -167,14 +190,17 @@ async function tick() {
 
 function start() {
   if (timer) return;
-  if (process.env.EMAIL_WORKER_ENABLED === 'false') {
-    logger.info('Email worker унтраалттай (EMAIL_WORKER_ENABLED=false).');
+  if (process.env.EMAIL_WORKER_ENABLED === "false") {
+    logger.info("Email worker унтраалттай (EMAIL_WORKER_ENABLED=false).");
     return;
   }
   timer = setInterval(tick, INTERVAL_MS);
   timer.unref(); // graceful shutdown-ийг саатуулахгүй
   setTimeout(tick, 3000).unref(); // server асаад удалгүй эхний шалгалт
-  logger.info('Email worker ажиллаж эхэллээ', { intervalMs: INTERVAL_MS, batchSize: BATCH_SIZE });
+  logger.info("Email worker ажиллаж эхэллээ", {
+    intervalMs: INTERVAL_MS,
+    batchSize: BATCH_SIZE,
+  });
 }
 
 function stop() {
