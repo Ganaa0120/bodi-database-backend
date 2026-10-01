@@ -23,6 +23,15 @@ const env = require("./env");
  *   өмнөх хэрэглэгчийн эрхийг өвлөхгүй).
  * - Connection-ийг хүсэлтийн анхны query хийгдэх үед л авна (lazy) —
  *   DB ашиглахгүй хүсэлт pool-ийг эзлэхгүй.
+ *
+ * Холболт тасрах үеийн тогтвортой байдал:
+ * - pg-pool зөвхөн pool дотор idle байгаа client-д error handler тавьдаг.
+ *   Хүсэлт авч ашиглаж байгаа (checked-out) client-ийн холболт гэнэт
+ *   тасарвал listener-гүй 'error' event бүх process-ийг унагана. Тиймээс
+ *   client бүрт өөрийн error listener тавьж, тасарсан client-ийг pool руу
+ *   буцаахгүй устгана.
+ * - keepAlive: router / NAT idle холболтыг чимээгүй тасалдаг асуудлаас
+ *   хамгаална.
  */
 
 const pool = new Pool({
@@ -34,17 +43,23 @@ const pool = new Pool({
   ssl: env.db.sslMode === "disable" ? false : { rejectUnauthorized: false },
   max: 15,
   idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 5000,
+  connectionTimeoutMillis: 10000,
+  keepAlive: true,
+  keepAliveInitialDelayMillis: 10000,
 });
 
 pool.on("error", (err) => {
   // eslint-disable-next-line no-console
-  console.error("[db] Unexpected error on idle client", err);
+  console.error("[db] Idle холболт тасарлаа:", err.message);
 });
 
 const contextStorage = new AsyncLocalStorage();
 
 const VALID_ROLES = new Set(["super_admin", "company", "department", "system"]);
+
+/** Client дээр тэмдэглэгээ хадгалах түлхүүрүүд (pg-ийн property-тэй давхцахгүй). */
+const ERROR_HANDLER_ATTACHED = Symbol("bodiErrorHandlerAttached");
+const CLIENT_BROKEN = Symbol("bodiClientBroken");
 
 class DbContextError extends Error {
   constructor(message) {
@@ -72,8 +87,27 @@ function createContext({
   };
 }
 
+/**
+ * Checked-out client-д error listener тавина. pg-pool client-уудыг дахин
+ * ашигладаг тул нэг client-д нэг л удаа тавина (listener хуримтлагдахгүй).
+ */
+function attachErrorHandler(client) {
+  // Шинээр pool-оос авсан бүрт "эвдэрсэн" тэмдэглэгээг цэвэрлэнэ.
+  client[CLIENT_BROKEN] = false;
+  if (client[ERROR_HANDLER_ATTACHED]) return;
+  client[ERROR_HANDLER_ATTACHED] = true;
+
+  client.on("error", (err) => {
+    client[CLIENT_BROKEN] = true;
+    // eslint-disable-next-line no-console
+    console.error("[db] Идэвхтэй холболт тасарлаа:", err.message);
+  });
+}
+
 async function acquireClient(store) {
   const client = await pool.connect();
+  attachErrorHandler(client);
+
   const { role, userId, companyId, departmentId } = store.auth;
   try {
     await client.query(
@@ -107,6 +141,12 @@ async function releaseClient(store) {
     client = await store.clientPromise;
   } catch {
     return; // connection авч чадаагүй — буцаах зүйлгүй
+  }
+
+  // Холболт аль хэдийн тасарсан бол цэвэрлэх query ажиллахгүй — шууд устгана.
+  if (client[CLIENT_BROKEN]) {
+    client.release(new Error("Холболт тасарсан"));
+    return;
   }
 
   try {
@@ -202,8 +242,11 @@ function runRequestInContext(req, res, next, auth) {
 
 /**
  * Нэвтрэхээс өмнөх endpoint-уудад (login, refresh) зориулсан context.
- * RLS дээр 'system' role нь зөвхөн users, refresh_tokens, audit_log-д
- * хандах эрхтэй.
+ * RLS дээр 'system' role нь зөвхөн p_system_* policy-той хүснэгтүүдэд
+ * (users, refresh_tokens, audit_log, мэдэгдлийн хүснэгтүүд) хандана.
+ *
+ * АНХААР: энэ context RLS-ийн хэрэглэгчийн шүүлтийг тойрно. Зөвхөн
+ * хэрэглэгчийн input-оор context сонгогддоггүй route-д ашиглана.
  */
 function systemContext(req, res, next) {
   return runRequestInContext(req, res, next, { role: "system" });
@@ -214,7 +257,7 @@ function systemContext(req, res, next) {
  * system context. fn дууссаны дараа connection-ийг цэвэрлээд pool руу буцаана.
  */
 function runInSystemContext(fn) {
-  const store = createContext({ role: 'system' });
+  const store = createContext({ role: "system" });
   return contextStorage.run(store, async () => {
     try {
       return await fn();

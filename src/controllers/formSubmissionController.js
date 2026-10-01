@@ -1,35 +1,129 @@
 'use strict';
 
 const { z } = require('zod');
-const { query } = require('../config/db');
+const { query, withTransaction } = require('../config/db');
 const auditService = require('../services/auditService');
+const { validateSubmissionData } = require('../constants/formFields');
+const { syncSubmissionValues } = require('../services/submissionValuesService');
+const HttpError = require('../utils/httpError');
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-const dataFieldsSchema = z
-  .record(z.string())
-  .refine((d) => Object.keys(d).length > 0, { message: 'Дор хаяж нэг талбар бөглөнө үү.' });
+/** Бүх RETURNING-д ижил багануудыг буцаана. */
+const SUBMISSION_COLUMNS = `id, company_id, department_id, submitted_by, title, data, status,
+  rejection_reason, reviewed_by, reviewed_at, edit_unlocked,
+  period_year, period_quarter, created_at, updated_at`;
+
+/** Шинэ хугацаа эхэнд, хугацаагүй хуучин тайлангууд төгсгөлд. */
+const ORDER_BY_PERIOD = `ORDER BY fs.period_year DESC NULLS LAST,
+                                 fs.period_quarter DESC NULLS LAST,
+                                 fs.created_at DESC`;
+
+// Утгуудыг (key → string) авна. Нэгжийн дүрмээр validateSubmissionData шалгана.
+const dataRecordSchema = z.record(z.string().max(50, 'Утга хэт урт байна.'));
+
+const periodYear = z
+  .number({ invalid_type_error: 'Тайлант оныг сонгоно уу.', required_error: 'Тайлант оныг сонгоно уу.' })
+  .int()
+  .min(1990, 'Он 1990-ээс хойш байх ёстой.')
+  .max(2100, 'Он 2100-аас өмнө байх ёстой.');
+
+const periodQuarter = z
+  .number({ invalid_type_error: 'Улирлыг сонгоно уу.', required_error: 'Улирлыг сонгоно уу.' })
+  .int()
+  .min(1, 'Улирал 1-4 байх ёстой.')
+  .max(4, 'Улирал 1-4 байх ёстой.');
 
 const createSchema = z.object({
   title: z.string().trim().min(2, 'Тайлангийн нэрийг оруулна уу.').max(200),
-  data: dataFieldsSchema,
+  data: dataRecordSchema,
+  period_year: periodYear,
+  period_quarter: periodQuarter,
 });
 
+const resubmitSchema = createSchema;
+
+// Компани засахад хугацааг заавал биш — зөвхөн хоёуланг нь хамт илгээвэл солино.
+const companyEditSchema = z
+  .object({
+    title: z.string().trim().min(2).max(200),
+    data: dataRecordSchema,
+    period_year: periodYear.optional(),
+    period_quarter: periodQuarter.optional(),
+  })
+  .refine((b) => (b.period_year === undefined) === (b.period_quarter === undefined), {
+    message: 'Он болон улирлыг хамт илгээнэ үү.',
+    path: ['period_quarter'],
+  });
+
+/**
+ * Хэлтсийн загварын талбарууд.
+ * db — `{ query }` эсвэл transaction-ий client (хоёулаа .query-тэй).
+ */
+async function loadDepartmentSchema(db, departmentId) {
+  const result = await db.query(
+    `SELECT t.form_schema
+     FROM departments d
+     JOIN department_templates t ON t.id = d.template_id
+     WHERE d.id = $1`,
+    [departmentId]
+  );
+  return result.rows[0] ? result.rows[0].form_schema : null;
+}
+
+function isPeriodConflict(err) {
+  return err && err.code === '23505' && err.constraint === 'form_submissions_dept_period_uniq';
+}
+
+function periodConflictResponse(res, year, quarter) {
+  return res.status(409).json({
+    error: `${year} оны ${quarter}-р улирлын тайлан аль хэдийн илгээгдсэн байна.`,
+  });
+}
+
+function assertUuid(id) {
+  if (!UUID_REGEX.test(id)) throw new HttpError(400, 'ID буруу байна.');
+}
+
+/*
+ * submission_values-ийн инвариант:
+ * form_submissions-ийн status / data / хугацаа / deleted_at өөрчлөгдөх БҮХ
+ * функц (review, resubmit, updateByCompany, deleteByCompany) өөрчлөлтөө
+ * withTransaction дотор хийж, ижил transaction-д syncSubmissionValues дуудна.
+ * Шинэ ийм функц нэмбэл мөн адил хийнэ.
+ */
+
 async function create(req, res, next) {
+  let body;
   try {
-    const { title, data } = createSchema.parse(req.body);
+    body = createSchema.parse(req.body);
     const { companyId, departmentId, userId } = req.auth;
 
     if (!departmentId) {
       return res.status(400).json({ error: 'Танай хэрэглэгч хэлтэст хамаарахгүй байна.' });
     }
 
+    const formSchema = await loadDepartmentSchema({ query }, departmentId);
+    if (!formSchema) return res.status(404).json({ error: 'Хэлтсийн форм олдсонгүй.' });
+
+    const checked = validateSubmissionData(formSchema, body.data, body.period_quarter);
+    if (checked.error) return res.status(400).json({ error: checked.error });
+
+    // Шинэ тайлан үргэлж pending — submission_values-д нөлөөлөхгүй.
     const result = await query(
-      `INSERT INTO form_submissions (company_id, department_id, submitted_by, title, data, status)
-       VALUES ($1, $2, $3, $4, $5, 'pending')
-       RETURNING id, company_id, department_id, submitted_by, title, data, status,
-                 rejection_reason, reviewed_by, reviewed_at, edit_unlocked, created_at, updated_at`,
-      [companyId, departmentId, userId, title, JSON.stringify(data)]
+      `INSERT INTO form_submissions
+         (company_id, department_id, submitted_by, title, data, status, period_year, period_quarter)
+       VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7)
+       RETURNING ${SUBMISSION_COLUMNS}`,
+      [
+        companyId,
+        departmentId,
+        userId,
+        body.title,
+        JSON.stringify(checked.value),
+        body.period_year,
+        body.period_quarter,
+      ]
     );
 
     await auditService.logEvent({
@@ -37,11 +131,16 @@ async function create(req, res, next) {
       action: 'FORM_SUBMITTED',
       ipAddress: req.ip,
       userAgent: req.headers['user-agent'] || null,
-      metadata: { submissionId: result.rows[0].id, departmentId },
+      metadata: {
+        submissionId: result.rows[0].id,
+        departmentId,
+        period: `${body.period_year}-Q${body.period_quarter}`,
+      },
     });
 
     return res.status(201).json({ submission: result.rows[0] });
   } catch (err) {
+    if (isPeriodConflict(err)) return periodConflictResponse(res, body.period_year, body.period_quarter);
     return next(err);
   }
 }
@@ -54,37 +153,28 @@ async function list(req, res, next) {
   try {
     const { role, companyId, departmentId } = req.auth;
 
+    // form_schema — тайлангийн утгуудыг (код → утга) нэр, нэгжтэй нь харуулахад.
+    // Компани олон хэлтсийн (өөр өөр загвартай) тайланг харах тул мөр бүрт хавсаргана.
+    const baseSelect = `
+      SELECT fs.*, d.name AS department_name, c.name AS company_name, u.full_name AS submitted_by_name,
+             t.form_schema AS form_schema
+      FROM form_submissions fs
+      JOIN departments d ON d.id = fs.department_id
+      JOIN companies c ON c.id = fs.company_id
+      JOIN users u ON u.id = fs.submitted_by
+      LEFT JOIN department_templates t ON t.id = d.template_id`;
+
     let result;
     if (role === 'super_admin') {
-      result = await query(
-        `SELECT fs.*, d.name AS department_name, c.name AS company_name, u.full_name AS submitted_by_name
-         FROM form_submissions fs
-         JOIN departments d ON d.id = fs.department_id
-         JOIN companies c ON c.id = fs.company_id
-         JOIN users u ON u.id = fs.submitted_by
-         WHERE fs.deleted_at IS NULL
-         ORDER BY fs.created_at DESC`
-      );
+      result = await query(`${baseSelect} WHERE fs.deleted_at IS NULL ${ORDER_BY_PERIOD}`);
     } else if (role === 'company') {
       result = await query(
-        `SELECT fs.*, d.name AS department_name, c.name AS company_name, u.full_name AS submitted_by_name
-         FROM form_submissions fs
-         JOIN departments d ON d.id = fs.department_id
-         JOIN companies c ON c.id = fs.company_id
-         JOIN users u ON u.id = fs.submitted_by
-         WHERE fs.company_id = $1 AND fs.deleted_at IS NULL
-         ORDER BY fs.created_at DESC`,
+        `${baseSelect} WHERE fs.company_id = $1 AND fs.deleted_at IS NULL ${ORDER_BY_PERIOD}`,
         [companyId]
       );
     } else {
       result = await query(
-        `SELECT fs.*, d.name AS department_name, c.name AS company_name, u.full_name AS submitted_by_name
-         FROM form_submissions fs
-         JOIN departments d ON d.id = fs.department_id
-         JOIN companies c ON c.id = fs.company_id
-         JOIN users u ON u.id = fs.submitted_by
-         WHERE fs.department_id = $1 AND fs.deleted_at IS NULL
-         ORDER BY fs.created_at DESC`,
+        `${baseSelect} WHERE fs.department_id = $1 AND fs.deleted_at IS NULL ${ORDER_BY_PERIOD}`,
         [departmentId]
       );
     }
@@ -95,52 +185,60 @@ async function list(req, res, next) {
   }
 }
 
-const resubmitSchema = z.object({
-  title: z.string().trim().min(2).max(200),
-  data: dataFieldsSchema,
-});
-
 async function resubmit(req, res, next) {
+  let body;
   try {
     const { id } = req.params;
-    if (!UUID_REGEX.test(id)) {
-      return res.status(400).json({ error: 'ID буруу байна.' });
-    }
+    assertUuid(id);
+    body = resubmitSchema.parse(req.body);
+    const { departmentId, userId } = req.auth;
 
-    const { title, data } = resubmitSchema.parse(req.body);
+    const submission = await withTransaction(async (client) => {
+      const existing = await client.query(
+        `SELECT id, status FROM form_submissions
+         WHERE id = $1 AND department_id = $2 AND deleted_at IS NULL
+         FOR UPDATE`,
+        [id, departmentId]
+      );
+      if (existing.rows.length === 0) throw new HttpError(404, 'Тайлан олдсонгүй.');
+      if (existing.rows[0].status !== 'rejected') {
+        throw new HttpError(409, 'Зөвхөн татгалзсан тайланг л засаж болно.');
+      }
 
-    const existing = await query(
-      `SELECT id, status FROM form_submissions WHERE id = $1 AND department_id = $2 AND deleted_at IS NULL`,
-      [id, req.auth.departmentId]
-    );
-    if (existing.rows.length === 0) {
-      return res.status(404).json({ error: 'Тайлан олдсонгүй.' });
-    }
-    if (existing.rows[0].status !== 'rejected') {
-      return res.status(409).json({ error: 'Зөвхөн татгалзсан тайланг л засаж болно.' });
-    }
+      const formSchema = await loadDepartmentSchema(client, departmentId);
+      if (!formSchema) throw new HttpError(404, 'Хэлтсийн форм олдсонгүй.');
 
-    const result = await query(
-      `UPDATE form_submissions
-       SET title = $1, data = $2, status = 'pending',
-           rejection_reason = NULL, reviewed_by = NULL, reviewed_at = NULL,
-           updated_at = now()
-       WHERE id = $3
-       RETURNING id, company_id, department_id, submitted_by, title, data, status,
-                 rejection_reason, reviewed_by, reviewed_at, edit_unlocked, created_at, updated_at`,
-      [title, JSON.stringify(data), id]
-    );
+      const checked = validateSubmissionData(formSchema, body.data, body.period_quarter);
+      if (checked.error) throw new HttpError(400, checked.error);
+
+      const result = await client.query(
+        `UPDATE form_submissions
+         SET title = $1, data = $2, status = 'pending',
+             period_year = $3, period_quarter = $4,
+             rejection_reason = NULL, reviewed_by = NULL, reviewed_at = NULL,
+             updated_at = now()
+         WHERE id = $5
+         RETURNING ${SUBMISSION_COLUMNS}`,
+        [body.title, JSON.stringify(checked.value), body.period_year, body.period_quarter, id]
+      );
+
+      // pending болсон тул утга 0 мөр байх ёстой — инвариантыг баталгаажуулна.
+      await syncSubmissionValues(client, id);
+      return result.rows[0];
+    });
 
     await auditService.logEvent({
-      userId: req.auth.userId,
+      userId,
       action: 'FORM_RESUBMITTED',
       ipAddress: req.ip,
       userAgent: req.headers['user-agent'] || null,
-      metadata: { submissionId: id },
+      metadata: { submissionId: id, period: `${body.period_year}-Q${body.period_quarter}` },
     });
 
-    return res.status(200).json({ submission: result.rows[0] });
+    return res.status(200).json({ submission });
   } catch (err) {
+    if (err instanceof HttpError) return res.status(err.statusCode).json({ error: err.message });
+    if (isPeriodConflict(err)) return periodConflictResponse(res, body.period_year, body.period_quarter);
     return next(err);
   }
 }
@@ -153,97 +251,121 @@ const reviewSchema = z.object({
 async function review(req, res, next) {
   try {
     const { id } = req.params;
-    if (!UUID_REGEX.test(id)) {
-      return res.status(400).json({ error: 'ID буруу байна.' });
-    }
-
+    assertUuid(id);
     const { action, rejection_reason } = reviewSchema.parse(req.body);
-
-    const existing = await query(
-      `SELECT id, status FROM form_submissions WHERE id = $1 AND company_id = $2 AND deleted_at IS NULL`,
-      [id, req.auth.companyId]
-    );
-    if (existing.rows.length === 0) {
-      return res.status(404).json({ error: 'Тайлан олдсонгүй.' });
-    }
-    if (existing.rows[0].status !== 'pending') {
-      return res.status(409).json({ error: 'Энэ тайлан аль хэдийн шийдвэрлэгдсэн байна.' });
-    }
-
+    const { companyId, userId } = req.auth;
     const newStatus = action === 'accept' ? 'accepted' : 'rejected';
 
-    const result = await query(
-      `UPDATE form_submissions
-       SET status = $1, rejection_reason = $2, reviewed_by = $3, reviewed_at = now(), updated_at = now()
-       WHERE id = $4
-       RETURNING id, company_id, department_id, submitted_by, title, data, status,
-                 rejection_reason, reviewed_by, reviewed_at, edit_unlocked, created_at, updated_at`,
-      [newStatus, action === 'reject' ? rejection_reason || null : null, req.auth.userId, id]
-    );
+    // Төлөв солих + KPI утгуудыг бүртгэх нь НЭГ transaction. Утга бүртгэж
+    // чадахгүй бол (код давхардсан, утга буруу) тайлан accepted болохгүй.
+    const { submission, valuesCount } = await withTransaction(async (client) => {
+      const existing = await client.query(
+        `SELECT id, status FROM form_submissions
+         WHERE id = $1 AND company_id = $2 AND deleted_at IS NULL
+         FOR UPDATE`,
+        [id, companyId]
+      );
+      if (existing.rows.length === 0) throw new HttpError(404, 'Тайлан олдсонгүй.');
+      if (existing.rows[0].status !== 'pending') {
+        throw new HttpError(409, 'Энэ тайлан аль хэдийн шийдвэрлэгдсэн байна.');
+      }
+
+      const result = await client.query(
+        `UPDATE form_submissions
+         SET status = $1, rejection_reason = $2, reviewed_by = $3, reviewed_at = now(), updated_at = now()
+         WHERE id = $4
+         RETURNING ${SUBMISSION_COLUMNS}`,
+        [newStatus, action === 'reject' ? rejection_reason || null : null, userId, id]
+      );
+
+      const synced = await syncSubmissionValues(client, id);
+      return { submission: result.rows[0], valuesCount: synced.count };
+    });
 
     await auditService.logEvent({
-      userId: req.auth.userId,
+      userId,
       action: action === 'accept' ? 'FORM_ACCEPTED' : 'FORM_REJECTED',
       ipAddress: req.ip,
       userAgent: req.headers['user-agent'] || null,
-      metadata: { submissionId: id, reason: rejection_reason || null },
+      metadata: { submissionId: id, reason: rejection_reason || null, valuesCount },
     });
 
-    return res.status(200).json({ submission: result.rows[0] });
+    return res.status(200).json({ submission });
   } catch (err) {
+    if (err instanceof HttpError) return res.status(err.statusCode).json({ error: err.message });
     return next(err);
   }
 }
 
-const companyEditSchema = z.object({
-  title: z.string().trim().min(2).max(200),
-  data: dataFieldsSchema,
-});
-
 async function updateByCompany(req, res, next) {
+  let targetYear;
+  let targetQuarter;
   try {
     const { id } = req.params;
-    if (!UUID_REGEX.test(id)) {
-      return res.status(400).json({ error: 'ID буруу байна.' });
-    }
+    assertUuid(id);
+    const body = companyEditSchema.parse(req.body);
+    const { companyId, userId } = req.auth;
 
-    const { title, data } = companyEditSchema.parse(req.body);
+    const { submission, valuesCount } = await withTransaction(async (client) => {
+      const existing = await client.query(
+        `SELECT id, department_id, status, edit_unlocked, period_year, period_quarter
+         FROM form_submissions
+         WHERE id = $1 AND company_id = $2 AND deleted_at IS NULL
+         FOR UPDATE`,
+        [id, companyId]
+      );
+      if (existing.rows.length === 0) throw new HttpError(404, 'Тайлан олдсонгүй.');
 
-    const existing = await query(
-      `SELECT id, status, edit_unlocked FROM form_submissions WHERE id = $1 AND company_id = $2 AND deleted_at IS NULL`,
-      [id, req.auth.companyId]
-    );
-    if (existing.rows.length === 0) {
-      return res.status(404).json({ error: 'Тайлан олдсонгүй.' });
-    }
+      const row = existing.rows[0];
+      const canEdit = row.status !== 'accepted' || row.edit_unlocked;
+      if (!canEdit) {
+        throw new HttpError(403, 'Зөвшөөрсөн тайланг засахын тулд Super Admin-с зөвшөөрөл авах шаардлагатай.');
+      }
 
-    const row = existing.rows[0];
-    const canEdit = row.status !== 'accepted' || row.edit_unlocked;
-    if (!canEdit) {
-      return res.status(403).json({
-        error: 'Зөвшөөрсөн тайланг засахын тулд Super Admin-с зөвшөөрөл авах шаардлагатай.',
+      targetYear = body.period_year ?? row.period_year;
+      targetQuarter = body.period_quarter ?? row.period_quarter;
+
+      const formSchema = await loadDepartmentSchema(client, row.department_id);
+      if (!formSchema) throw new HttpError(404, 'Хэлтсийн форм олдсонгүй.');
+
+      // Компани хуучин тайланг засахад дараа нь нэмэгдсэн "заавал" талбарыг
+      // шаардахгүй — зөвхөн оруулсан утгуудыг нэгжийн дүрмээр шалгана.
+      const checked = validateSubmissionData(formSchema, body.data, targetQuarter, {
+        enforceRequired: false,
       });
-    }
+      if (checked.error) throw new HttpError(400, checked.error);
 
-    const result = await query(
-      `UPDATE form_submissions
-       SET title = $1, data = $2, edit_unlocked = false, updated_at = now()
-       WHERE id = $3
-       RETURNING id, company_id, department_id, submitted_by, title, data, status,
-                 rejection_reason, reviewed_by, reviewed_at, edit_unlocked, created_at, updated_at`,
-      [title, JSON.stringify(data), id]
-    );
+      const result = await client.query(
+        `UPDATE form_submissions
+         SET title = $1, data = $2, period_year = $3, period_quarter = $4,
+             edit_unlocked = false, updated_at = now()
+         WHERE id = $5
+         RETURNING ${SUBMISSION_COLUMNS}`,
+        [body.title, JSON.stringify(checked.value), targetYear, targetQuarter, id]
+      );
+
+      // Accepted тайланг (edit_unlocked) засвал KPI утгууд шинэ утгаар солигдоно.
+      const synced = await syncSubmissionValues(client, id);
+      return { submission: result.rows[0], valuesCount: synced.count };
+    });
 
     await auditService.logEvent({
-      userId: req.auth.userId,
+      userId,
       action: 'FORM_EDITED_BY_COMPANY',
       ipAddress: req.ip,
       userAgent: req.headers['user-agent'] || null,
-      metadata: { submissionId: id },
+      metadata: {
+        submissionId: id,
+        period: `${targetYear}-Q${targetQuarter}`,
+        status: submission.status,
+        valuesCount,
+      },
     });
 
-    return res.status(200).json({ submission: result.rows[0] });
+    return res.status(200).json({ submission });
   } catch (err) {
+    if (err instanceof HttpError) return res.status(err.statusCode).json({ error: err.message });
+    if (isPeriodConflict(err)) return periodConflictResponse(res, targetYear, targetQuarter);
     return next(err);
   }
 }
@@ -251,30 +373,32 @@ async function updateByCompany(req, res, next) {
 async function deleteByCompany(req, res, next) {
   try {
     const { id } = req.params;
-    if (!UUID_REGEX.test(id)) {
-      return res.status(400).json({ error: 'ID буруу байна.' });
-    }
+    assertUuid(id);
+    const { companyId, userId } = req.auth;
 
-    const existing = await query(
-      `SELECT id, status, edit_unlocked FROM form_submissions WHERE id = $1 AND company_id = $2 AND deleted_at IS NULL`,
-      [id, req.auth.companyId]
-    );
-    if (existing.rows.length === 0) {
-      return res.status(404).json({ error: 'Тайлан олдсонгүй.' });
-    }
+    await withTransaction(async (client) => {
+      const existing = await client.query(
+        `SELECT id, status, edit_unlocked FROM form_submissions
+         WHERE id = $1 AND company_id = $2 AND deleted_at IS NULL
+         FOR UPDATE`,
+        [id, companyId]
+      );
+      if (existing.rows.length === 0) throw new HttpError(404, 'Тайлан олдсонгүй.');
 
-    const row = existing.rows[0];
-    const canDelete = row.status !== 'accepted' || row.edit_unlocked;
-    if (!canDelete) {
-      return res.status(403).json({
-        error: 'Зөвшөөрсөн тайланг устгахын тулд Super Admin-с зөвшөөрөл авах шаардлагатай.',
-      });
-    }
+      const row = existing.rows[0];
+      const canDelete = row.status !== 'accepted' || row.edit_unlocked;
+      if (!canDelete) {
+        throw new HttpError(403, 'Зөвшөөрсөн тайланг устгахын тулд Super Admin-с зөвшөөрөл авах шаардлагатай.');
+      }
 
-    await query('UPDATE form_submissions SET deleted_at = now() WHERE id = $1', [id]);
+      await client.query('UPDATE form_submissions SET deleted_at = now() WHERE id = $1', [id]);
+
+      // Устгасан тайлангийн утгууд KPI-аас хасагдана.
+      await syncSubmissionValues(client, id);
+    });
 
     await auditService.logEvent({
-      userId: req.auth.userId,
+      userId,
       action: 'FORM_DELETED_BY_COMPANY',
       ipAddress: req.ip,
       userAgent: req.headers['user-agent'] || null,
@@ -283,6 +407,7 @@ async function deleteByCompany(req, res, next) {
 
     return res.status(204).send();
   } catch (err) {
+    if (err instanceof HttpError) return res.status(err.statusCode).json({ error: err.message });
     return next(err);
   }
 }
